@@ -22,8 +22,11 @@ logs/
 outputs/
 runs/
 wandb/
+reports/
 reports/*.csv
 reports/*.json
+reports/**/*.csv
+reports/**/*.json
 
 # Data
 data/
