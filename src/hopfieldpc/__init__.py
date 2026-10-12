@@ -11,10 +11,12 @@ from .memory import HopfieldMemory
 from .diagnostics import (
     argmax_memory_index,
     attention_entropy,
+    build_retrieval_diagnostics,
     max_attention_weight,
     retrieval_distance,
     selected_memory_distance,
     topk_mass,
+    topk_recall,
 )
 
 __all__ = [
@@ -27,8 +29,10 @@ __all__ = [
     "multi_step_retrieve",
     "argmax_memory_index",
     "attention_entropy",
+    "build_retrieval_diagnostics",
     "max_attention_weight",
     "retrieval_distance",
     "selected_memory_distance",
     "topk_mass",
+    "topk_recall",
 ]

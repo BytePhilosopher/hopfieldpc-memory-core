@@ -148,6 +148,47 @@ def selected_memory_distance(
     return retrieval_distance(retrieved, selected, p=p)
 
 
+def topk_recall(
+    weights: torch.Tensor,
+    target_indices: torch.Tensor,
+    *,
+    k: int,
+) -> torch.Tensor:
+    """Check whether the target memory index is inside the top-k retrieved memories.
+
+    Args:
+        weights: Softmax memory weights with shape [batch_size, num_memories].
+        target_indices: Correct memory indices with shape [batch_size].
+        k: Number of top memories to check.
+
+    Returns:
+        Float tensor with shape [batch_size], where 1.0 means the target
+        memory is in the top-k and 0.0 means it is not.
+    """
+
+    _validate_weights(weights)
+
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        raise ValueError(f"k must be a positive integer, got {k!r}.")
+
+    if target_indices.ndim != 1:
+        raise ValueError(
+            "target_indices must have shape [batch_size], "
+            f"got {tuple(target_indices.shape)}."
+        )
+
+    if target_indices.shape[0] != weights.shape[0]:
+        raise ValueError(
+            "target_indices batch size must match weights batch size: "
+            f"{target_indices.shape[0]} != {weights.shape[0]}."
+        )
+
+    k = min(k, weights.shape[-1])
+    _, topk_indices = torch.topk(weights, k, dim=-1)
+    expanded_targets = target_indices.unsqueeze(-1).expand_as(topk_indices)
+    return (topk_indices == expanded_targets).any(dim=-1).float()
+
+
 def build_retrieval_diagnostics(
     *,
     query: torch.Tensor,
