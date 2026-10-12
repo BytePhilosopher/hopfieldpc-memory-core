@@ -1,0 +1,12 @@
+seed: 42
+dim: 64
+num_memories: 50
+num_queries: 100
+noise_level: 0.2
+
+beta_values: [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+normalize: false
+num_updates: 1
+reports_dir: "reports/beta_sweep"
+save_plot: true
