@@ -98,13 +98,20 @@ def validate_query_memory(
 
     Raises:
         TypeError:
-            If query or memory is not a torch.Tensor, or their dtypes differ.
+            If query or memory is not a floating-point torch.Tensor, or their
+            dtypes differ.
         HopfieldShapeError:
             If tensor ranks or dimensions are invalid.
     """
 
     query = _require_tensor("query", query)
     memory = _require_tensor("memory", memory)
+
+    if not query.is_floating_point() or not memory.is_floating_point():
+        raise TypeError(
+            "query and memory must be floating-point tensors, "
+            f"got {query.dtype} and {memory.dtype}."
+        )
 
     if query.dtype != memory.dtype:
         raise TypeError(

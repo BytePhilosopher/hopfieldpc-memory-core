@@ -48,8 +48,12 @@ def hopfield_energy(
 
     validate_query_memory(query=query, memory=memory)
 
-    scores = beta * torch.matmul(query, memory.transpose(0, 1))
-    energy = -(1.0 / beta) * torch.logsumexp(scores, dim=-1)
+    similarities = torch.matmul(query, memory.transpose(0, 1))
+    # Same as -logsumexp(beta * similarities) / beta, but beta never scales the
+    # uncentered similarities, so large scores cannot overflow.
+    max_similarity = similarities.amax(dim=-1, keepdim=True)
+    log_sum = torch.logsumexp(beta * (similarities - max_similarity), dim=-1)
+    energy = -max_similarity.squeeze(-1) - log_sum / beta
 
     if include_constants:
         num_memories = memory.shape[0]

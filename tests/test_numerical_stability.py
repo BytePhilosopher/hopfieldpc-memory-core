@@ -120,6 +120,49 @@ def test_centering_prevents_beta_scaling_overflow() -> None:
     assert torch.equal(weights, torch.tensor([[1.0, 0.0]]))
 
 
+def test_energy_is_finite_when_beta_scaling_would_overflow() -> None:
+    query = torch.tensor([[1e19, 0.0]])
+    memory = torch.tensor([[1e18, 0.0], [0.0, 1.0]])
+
+    energy = hopfield_energy(query, memory, beta=100.0)
+
+    assert torch.isfinite(energy).all()
+    torch.testing.assert_close(energy, -(query @ memory.T).amax(dim=-1))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_precision_energy_is_finite_for_large_scores(dtype: torch.dtype) -> None:
+    query = torch.full((1, 64), 5.0, dtype=dtype)
+    memory = torch.stack(
+        [
+            torch.full((64,), 5.0, dtype=dtype),
+            torch.zeros(64, dtype=dtype),
+        ]
+    )
+
+    energy = hopfield_energy(query, memory, beta=100.0)
+
+    assert energy.dtype == dtype
+    torch.testing.assert_close(energy, torch.tensor([-1600.0], dtype=dtype))
+
+
+@pytest.mark.parametrize("beta", [0.1, 1.0, 10.0])
+def test_energy_matches_float64_reference(beta: float) -> None:
+    generator = torch.Generator().manual_seed(5)
+    query = torch.randn(
+        8, 16, generator=generator, dtype=torch.float64, requires_grad=True
+    )
+    memory = torch.randn(20, 16, generator=generator, dtype=torch.float64)
+
+    energy = hopfield_energy(query, memory, beta=beta)
+    reference = -torch.logsumexp(beta * query @ memory.T, dim=-1) / beta
+    (grad,) = torch.autograd.grad(energy.sum(), query)
+    (reference_grad,) = torch.autograd.grad(reference.sum(), query)
+
+    torch.testing.assert_close(energy, reference, atol=1e-12, rtol=1e-10)
+    torch.testing.assert_close(grad, reference_grad, atol=1e-12, rtol=1e-10)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("beta", [0.5, 2.0, 10.0])
@@ -281,6 +324,23 @@ def test_external_memory_dtype_mismatch_raises() -> None:
 
     with pytest.raises(TypeError, match="must share a dtype"):
         hopfield_retrieve(query, memory)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.int32, torch.bool, torch.complex64]
+)
+def test_non_floating_tensors_are_rejected(dtype: torch.dtype) -> None:
+    query = torch.ones((2, 4), dtype=dtype)
+    memory = torch.ones((3, 4), dtype=dtype)
+
+    with pytest.raises(TypeError, match="must be floating-point tensors"):
+        hopfield_retrieve(query, memory)
+
+    with pytest.raises(TypeError, match="must be floating-point tensors"):
+        HopfieldMemory(dim=4)(query, memory)
+
+    with pytest.raises(TypeError, match="must be floating-point tensors"):
+        hopfield_energy(query, memory)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
