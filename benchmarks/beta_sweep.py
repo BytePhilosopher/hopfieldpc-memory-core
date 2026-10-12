@@ -242,7 +242,6 @@ def print_beta_sweep_table(
     results: list[dict[str, Any]],
     baseline_query_distance: float | None = None,
 ) -> None:
-    """Print results in a clean formatted table adhering to Phase 5 specification."""
     header = (
         f"{'beta':>7} | {'top1_accuracy':>13} | {'mean_entropy':>12} | "
         f"{'normalized_entropy':>18} | {'mean_max_weight':>15} | {'mean_retrieval_distance':>23}"
