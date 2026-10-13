@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import nn
 
-from hopfieldpc import HopfieldMemory, HopfieldShapeError
+from hopfieldpc import HopfieldMemory
 
 
 def test_external_memory_works() -> None:

@@ -37,20 +37,28 @@ def attention_entropy(
         normalize: If True, divide by log(num_memories), so uniform entropy is 1.
 
     Returns:
-        Entropy tensor with shape [batch_size].
+        Entropy tensor with shape [batch_size]. Float16 and bfloat16 weights
+        are evaluated and returned in float32 for numerical stability.
     """
 
     _validate_weights(weights)
 
-    safe_weights = weights.clamp_min(eps)
-    entropy = -(weights * safe_weights.log()).sum(dim=-1)
+    entropy_weights = (
+        weights.float()
+        if weights.dtype in (torch.float16, torch.bfloat16)
+        else weights
+    )
+    safe_weights = entropy_weights.clamp_min(eps)
+    entropy = -(entropy_weights * safe_weights.log()).sum(dim=-1)
 
     if normalize:
         num_memories = weights.shape[-1]
         if num_memories == 1:
             return torch.zeros_like(entropy)
         entropy = entropy / torch.log(
-            torch.tensor(float(num_memories), device=weights.device, dtype=weights.dtype)
+            torch.tensor(
+                float(num_memories), device=weights.device, dtype=entropy.dtype
+            )
         )
 
     return entropy
