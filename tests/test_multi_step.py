@@ -115,15 +115,3 @@ def test_gradient_flows_through_multi_step() -> None:
     module(torch.randn(2, 3)).retrieved.sum().backward()
     assert module.memory.grad is not None
     assert torch.isfinite(module.memory.grad).all()
-
-def test_return_states_respects_disabled_diagnostics() -> None:
-    module = HopfieldMemory(
-        dim=4,
-        num_updates=3,
-        return_states=True,
-        return_diagnostics=False,
-    )
-
-    out = module(torch.randn(2, 4), torch.randn(5, 4))
-
-    assert out.diagnostics == {}

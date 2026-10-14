@@ -1,16 +1,17 @@
 """Unit tests for synthetic nearest-memory retrieval benchmark and diagnostics."""
 
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
 import torch
 
+from benchmarks.synthetic_retrieval import run_benchmark
 from hopfieldpc.diagnostics import (
     attention_entropy,
     retrieval_distance,
     topk_mass,
     topk_recall,
 )
-from benchmarks.synthetic_retrieval import run_benchmark
 
 
 def test_diagnostics_functions() -> None:
