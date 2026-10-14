@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import warnings
 from pathlib import Path
 from typing import Any
-import matplotlib.pyplot as plt
 
 import torch
 import yaml
@@ -26,6 +26,12 @@ DEFAULT_BETAS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
 def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize configuration parameters for the beta sweep.
+
+    Note:
+        beta_sweep.py evaluates retrieval metrics across a range of beta values while
+        keeping other experimental parameters (memory size, noise level, query count,
+        and update steps) fixed. Multi-value lists for these parameters are rejected
+        with an explicit ValueError to prevent unintended silent truncation.
     """
     seed = config.get("seed", 42)
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
@@ -35,15 +41,29 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
         raise ValueError(f"dim must be a positive integer, got {dim!r}.")
 
-    # Support either num_memories or memory_size/memory_sizes for compatibility
-    if "num_memories" in config:
-        num_memories = config["num_memories"]
+    # Resolve num_memories / memory_size / memory_sizes
+    # Check memory_sizes first so that multi-value lists are detected even if num_memories is also present
+    if "memory_sizes" in config:
+        raw_memories = config["memory_sizes"]
     elif "memory_size" in config:
-        num_memories = config["memory_size"]
-    elif "memory_sizes" in config and isinstance(config["memory_sizes"], list) and config["memory_sizes"]:
-        num_memories = config["memory_sizes"][0]
+        raw_memories = config["memory_size"]
+    elif "num_memories" in config:
+        raw_memories = config["num_memories"]
     else:
         raise ValueError("Configuration must specify num_memories or memory_size.")
+
+    if isinstance(raw_memories, list):
+        if len(raw_memories) > 1:
+            raise ValueError(
+                f"beta_sweep.py sweeps only beta and fixes memory size to a single value. "
+                f"Got multi-value list for memory_sizes: {raw_memories}. "
+                f"Please specify a single integer via 'num_memories' or 'memory_size' (or a single-element list)."
+            )
+        if len(raw_memories) == 0:
+            raise ValueError("memory_sizes list cannot be empty.")
+        num_memories = raw_memories[0]
+    else:
+        num_memories = raw_memories
 
     if (
         isinstance(num_memories, bool)
@@ -52,13 +72,26 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError(f"num_memories must be a positive integer, got {num_memories!r}.")
 
-    # Support either num_queries or num_trials for compatibility
+    # Resolve num_queries / num_trials
     if "num_queries" in config:
-        num_queries = config["num_queries"]
+        raw_queries = config["num_queries"]
     elif "num_trials" in config:
-        num_queries = config["num_trials"]
+        raw_queries = config["num_trials"]
     else:
         raise ValueError("Configuration must specify num_queries or num_trials.")
+
+    if isinstance(raw_queries, list):
+        if len(raw_queries) > 1:
+            raise ValueError(
+                f"beta_sweep.py sweeps only beta and fixes query count to a single value. "
+                f"Got multi-value list for queries/trials: {raw_queries}. "
+                f"Please specify a single integer via 'num_queries' or 'num_trials' (or a single-element list)."
+            )
+        if len(raw_queries) == 0:
+            raise ValueError("num_queries list cannot be empty.")
+        num_queries = raw_queries[0]
+    else:
+        num_queries = raw_queries
 
     if (
         isinstance(num_queries, bool)
@@ -67,16 +100,33 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError(f"num_queries must be a positive integer, got {num_queries!r}.")
 
-    # Support noise_level or noise_levels
-    if "noise_level" in config:
-        noise_level = float(config["noise_level"])
-    elif "noise_levels" in config and isinstance(config["noise_levels"], list) and config["noise_levels"]:
-        noise_level = float(config["noise_levels"][0])
+    # Resolve noise_level / noise_levels
+    # Check noise_levels first so that multi-value lists are detected even if noise_level is also present
+    if "noise_levels" in config:
+        raw_noise = config["noise_levels"]
+    elif "noise_level" in config:
+        raw_noise = config["noise_level"]
     else:
         raise ValueError("Configuration must specify noise_level or noise_levels.")
 
-    if noise_level < 0:
-        raise ValueError(f"noise_level must be non-negative, got {noise_level!r}.")
+    if isinstance(raw_noise, list):
+        if len(raw_noise) > 1:
+            raise ValueError(
+                f"beta_sweep.py sweeps only beta and fixes noise level to a single value. "
+                f"Got multi-value list for noise_levels: {raw_noise}. "
+                f"Please specify a single numeric value via 'noise_level' (or a single-element list)."
+            )
+        if len(raw_noise) == 0:
+            raise ValueError("noise_levels list cannot be empty.")
+        raw_noise = raw_noise[0]
+
+    if (
+        isinstance(raw_noise, bool)
+        or not isinstance(raw_noise, (int, float))
+        or raw_noise < 0
+    ):
+        raise ValueError(f"noise_level must be a non-negative number, got {raw_noise!r}.")
+    noise_level = float(raw_noise)
 
     beta_values = config.get("beta_values", DEFAULT_BETAS)
     if not isinstance(beta_values, list) or len(beta_values) == 0:
@@ -90,9 +140,20 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
 
     normalize = bool(config.get("normalize", False))
 
-    num_updates = config.get("num_updates", 1)
-    if isinstance(num_updates, list) and num_updates:
-        num_updates = num_updates[0]
+    raw_updates = config.get("num_updates", 1)
+    if isinstance(raw_updates, list):
+        if len(raw_updates) > 1:
+            raise ValueError(
+                f"beta_sweep.py sweeps only beta and fixes num_updates to a single value. "
+                f"Got multi-value list for num_updates: {raw_updates}. "
+                f"Please specify a single positive integer for 'num_updates' (or a single-element list)."
+            )
+        if len(raw_updates) == 0:
+            raise ValueError("num_updates list cannot be empty.")
+        num_updates = raw_updates[0]
+    else:
+        num_updates = raw_updates
+
     if (
         isinstance(num_updates, bool)
         or not isinstance(num_updates, int)
@@ -126,7 +187,19 @@ def evaluate_beta_retrieval(
     num_updates: int = 1,
     normalize: bool = False,
 ) -> dict[str, float]:
-    """Run retrieval with a specific beta and calculate required evaluation metrics.
+    """Run retrieval with a specific beta and calculate evaluation metrics.
+
+    Metric Behavior across Beta:
+    - top1_accuracy: Largely beta-invariant for single-step retrieval because any
+      positive beta preserves the argmax ordering of logits (dot products). It serves
+      as a recall sanity check rather than a sensitivity indicator.
+    - mean_entropy & normalized_entropy: Main beta-sensitive metrics measuring attention
+      dispersion across memories (decreases monotonically as beta increases).
+    - mean_max_weight: Main beta-sensitive metric measuring attention sharpness and
+      attractor concentration (increases monotonically towards 1.0 as beta increases).
+    - mean_retrieval_distance: Main beta-sensitive metric measuring Euclidean distance
+      to the ground-truth target memory (decreases as beta increases and retrieval
+      transitions from a diffuse blend to the exact target attractor).
     """
     if beta <= 0:
         raise ValueError(f"beta must be positive, got {beta!r}.")
@@ -151,19 +224,21 @@ def evaluate_beta_retrieval(
         raise ValueError(f"Attention weights do not sum to 1 for beta={beta}.")
 
     # 1. Top-1 nearest-memory retrieval accuracy
+    # (Argmax ordering is preserved under positive beta scaling, making this metric
+    # mostly beta-invariant; useful as a recall sanity check).
     predicted_indices = weights.argmax(dim=-1)
     top1_accuracy = (predicted_indices == target_indices).float().mean().item()
 
-    # 2. Attention entropy
+    # 2. Attention entropy (primary beta-sensitive metric for dispersion)
     entropy = attention_entropy(weights)
     mean_entropy = entropy.mean().item()
     norm_entropy = attention_entropy(weights, normalize=True).mean().item()
 
-    # 3. Maximum attention weight
+    # 3. Maximum attention weight (primary beta-sensitive metric for sharpness)
     max_weights = max_attention_weight(weights)
     mean_max_weight = max_weights.mean().item()
 
-    # 4. Mean Euclidean distance to target memory
+    # 4. Mean Euclidean distance to target memory (primary beta-sensitive metric for attractor fidelity)
     targets = memory[target_indices]
     distances = retrieval_distance(retrieved, targets, p=2.0)
     mean_retrieval_distance = distances.mean().item()
@@ -262,7 +337,9 @@ def print_beta_sweep_table(
     print(separator)
     if baseline_query_distance is not None:
         print(f"Baseline mean query distance to target memory (L2): {baseline_query_distance:.4f}")
-    print("Distance measure: Euclidean (L2) distance in feature space.\n")
+    print("Distance measure: Euclidean (L2) distance in feature space.")
+    print("Note: Top-1 accuracy is largely beta-invariant (positive beta preserves argmax);")
+    print("      entropy, max attention weight, and retrieval distance are the primary beta-sensitive metrics.\n")
 
 
 def save_reports(
@@ -304,8 +381,23 @@ def plot_beta_sweep(
     baseline_query_distance: float | None = None,
 ) -> bool:
     """Generate a 4-panel diagnostic plot of beta sweep results.
+
+    Returns:
+        bool: True if the plot was generated and saved successfully, False if
+        matplotlib is unavailable or plot generation was skipped.
     """
-    
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        warnings.warn(
+            "matplotlib is not installed; skipping plot generation. "
+            "To enable diagnostic plots, install matplotlib (e.g., pip install matplotlib).",
+            UserWarning,
+            stacklevel=2,
+        )
+        return False
 
     betas = [r["beta"] for r in results]
     accs = [r["top1_accuracy"] for r in results]

@@ -10,6 +10,7 @@ import torch
 
 from benchmarks.beta_sweep import (
     evaluate_beta_retrieval,
+    plot_beta_sweep,
     run_beta_sweep,
     validate_beta_sweep_config,
 )
@@ -219,6 +220,7 @@ def test_increasing_beta_sharpens_attention_controlled() -> None:
     max_weights = []
     entropies = []
     distances = []
+    accuracies = []
 
     for b in betas:
         m = evaluate_beta_retrieval(
@@ -227,19 +229,24 @@ def test_increasing_beta_sharpens_attention_controlled() -> None:
             memory=memory,
             beta=b,
         )
+        accuracies.append(m["top1_accuracy"])
         max_weights.append(m["mean_max_weight"])
         entropies.append(m["mean_entropy"])
         distances.append(m["mean_retrieval_distance"])
 
-    # Max weight must be strictly monotonically increasing
+    # Top-1 accuracy is beta-invariant (remains 1.0 for all positive beta because argmax is preserved)
+    for acc in accuracies:
+        assert acc == pytest.approx(1.0)
+
+    # Max weight must be strictly monotonically increasing (beta-sensitive)
     for i in range(len(betas) - 1):
         assert max_weights[i + 1] > max_weights[i]
 
-    # Entropy must be strictly monotonically decreasing
+    # Entropy must be strictly monotonically decreasing (beta-sensitive)
     for i in range(len(betas) - 1):
         assert entropies[i + 1] < entropies[i]
 
-    # Distance to target memory must be strictly monotonically decreasing
+    # Distance to target memory must be strictly monotonically decreasing (beta-sensitive)
     for i in range(len(betas) - 1):
         assert distances[i + 1] < distances[i]
 
@@ -292,6 +299,76 @@ def test_invalid_configurations_raise_exceptions() -> None:
     with pytest.raises(ValueError, match="num_updates"):
         validate_beta_sweep_config({**base, "num_updates": True})
 
+    # Multi-value lists for fixed parameters must be explicitly rejected
+    with pytest.raises(ValueError, match="multi-value list for memory_sizes"):
+        validate_beta_sweep_config({**base, "memory_sizes": [10, 20]})
+
+    with pytest.raises(ValueError, match="multi-value list for noise_levels"):
+        validate_beta_sweep_config({**base, "noise_levels": [0.1, 0.2]})
+
+    with pytest.raises(ValueError, match="multi-value list for num_updates"):
+        validate_beta_sweep_config({**base, "num_updates": [1, 2]})
+
+    with pytest.raises(ValueError, match="multi-value list for queries/trials"):
+        validate_beta_sweep_config({**base, "num_queries": [10, 20]})
+
+    # Empty lists for fixed parameters must be rejected
+    with pytest.raises(ValueError, match="memory_sizes list cannot be empty"):
+        validate_beta_sweep_config({**base, "memory_sizes": []})
+
+    with pytest.raises(ValueError, match="noise_levels list cannot be empty"):
+        validate_beta_sweep_config({**base, "noise_levels": []})
+
+    with pytest.raises(ValueError, match="num_updates list cannot be empty"):
+        validate_beta_sweep_config({**base, "num_updates": []})
+
+
+def test_single_value_lists_are_normalized() -> None:
+    config: dict[str, Any] = {
+        "seed": 42,
+        "dim": 8,
+        "memory_sizes": [15],
+        "num_queries": [20],
+        "noise_levels": [0.25],
+        "num_updates": [2],
+        "beta_values": [1.0, 5.0],
+    }
+    validated = validate_beta_sweep_config(config)
+    assert validated["num_memories"] == 15
+    assert validated["num_queries"] == 20
+    assert validated["noise_level"] == 0.25
+    assert validated["num_updates"] == 2
+
+
+def test_plot_beta_sweep_graceful_fallback_without_matplotlib(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When matplotlib is unavailable, plot_beta_sweep issues a warning and returns False."""
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            raise ImportError("No module named 'matplotlib'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    dummy_results = [
+        {
+            "beta": 1.0,
+            "top1_accuracy": 1.0,
+            "mean_entropy": 0.5,
+            "normalized_entropy": 0.3,
+            "mean_max_weight": 0.8,
+            "mean_retrieval_distance": 0.2,
+        }
+    ]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        target_path = Path(tmp_dir) / "test_plot.png"
+        with pytest.warns(UserWarning, match="matplotlib is not installed"):
+            success = plot_beta_sweep(dummy_results, target_path)
+        assert success is False
+        assert not target_path.exists()
+
 
 def test_run_beta_sweep_reports_generation() -> None:
     config: dict[str, Any] = {
@@ -304,6 +381,16 @@ def test_run_beta_sweep_reports_generation() -> None:
         "save_plot": True,
     }
 
+    # Verify save_plot=False avoids creating the plot
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_dir = Path(tmp_dir) / "reports_no_plot"
+        results, meta = run_beta_sweep(config, output_dir=output_dir, save_plot=False)
+        assert len(results) == 2
+        assert (output_dir / "results.json").exists()
+        assert (output_dir / "results.csv").exists()
+        assert not (output_dir / "beta_sweep.png").exists()
+
+    # Verify save_plot=True generates the plot when matplotlib is available
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_dir = Path(tmp_dir) / "reports"
         results, meta = run_beta_sweep(config, output_dir=output_dir, save_plot=True)
@@ -317,4 +404,12 @@ def test_run_beta_sweep_reports_generation() -> None:
 
         assert json_path.exists()
         assert csv_path.exists()
-        assert plot_path.exists()
+
+        try:
+            import matplotlib  # noqa: F401
+            has_matplotlib = True
+        except ImportError:
+            has_matplotlib = False
+
+        if has_matplotlib:
+            assert plot_path.exists()
