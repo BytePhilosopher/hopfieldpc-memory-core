@@ -384,7 +384,7 @@ def evaluate_cluster_retrieval(
     beta: float,
     num_updates: int = 1,
     normalize: bool = False,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Execute Hopfield retrieval with specified beta and calculate aggregated cluster metrics."""
     if beta <= 0:
         raise ValueError(f"beta must be positive, got {beta!r}.")
