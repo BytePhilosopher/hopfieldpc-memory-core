@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from benchmarks.cluster_retrieval import (
-    DEFAULT_BETAS,
     compute_cluster_masses,
     compute_cluster_metrics,
     evaluate_cluster_retrieval,
@@ -88,8 +87,66 @@ def test_target_cluster_is_valid() -> None:
         num_queries=50,
         query_noise=0.05,
     )
+    assert queries_multi.shape == (50, 16)
     assert targets_multi.min().item() >= 0
     assert targets_multi.max().item() < 4
+
+
+def test_evaluate_cluster_retrieval_direct() -> None:
+    """Direct unit test for evaluate_cluster_retrieval and compute_cluster_metrics."""
+    memory = torch.tensor([
+        [1.0, 0.0],
+        [1.1, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.1],
+    ])
+    cluster_labels = torch.tensor([0, 0, 1, 1])
+    centers = torch.tensor([
+        [1.05, 0.0],
+        [0.0, 1.05],
+    ])
+    queries = torch.tensor([
+        [1.0, 0.0],
+    ])
+    target_clusters = torch.tensor([0])
+
+    metrics = evaluate_cluster_retrieval(
+        queries=queries,
+        target_clusters=target_clusters,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        beta=5.0,
+    )
+
+    assert "target_cluster_mass" in metrics
+    assert "distance_to_cluster" in metrics
+    assert "distance_to_nearest_memory" in metrics
+    assert metrics["target_cluster_mass"] > 0.90
+    assert metrics["top1_in_target_cluster"] == 1.0
+
+
+def test_compute_cluster_metrics_direct() -> None:
+    """Test compute_cluster_metrics directly with mock tensors."""
+    retrieved = torch.tensor([[1.0, 0.0]])
+    weights = torch.tensor([[0.7, 0.3]])
+    memory = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    centers = torch.tensor([[1.0, 0.0]])
+    cluster_labels = torch.tensor([0, 0])
+    target_clusters = torch.tensor([0])
+
+    metrics = compute_cluster_metrics(
+        retrieved=retrieved,
+        weights=weights,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        target_clusters=target_clusters,
+    )
+    assert metrics["target_cluster_mass"].item() == pytest.approx(1.0)
+    assert metrics["top1_mass"].item() == pytest.approx(0.7)
+    assert metrics["distance_to_cluster"].item() == pytest.approx(0.0)
+    assert metrics["distance_to_nearest_memory"].item() == pytest.approx(0.0)
 
 
 def test_attention_weights_and_cluster_masses_sum_to_one() -> None:
@@ -209,23 +266,6 @@ def test_reproducibility_with_same_seed() -> None:
 
 def test_scientific_transition_across_regimes() -> None:
     """Scientific acceptance test: verifies the three retrieval regimes.
-
-    LOW beta:
-        - target_cluster_mass is broad (near uniform across clusters)
-        - entropy is high
-        - top1_mass is low
-
-    MEDIUM beta:
-        - target_cluster_mass is high (> 0.90)
-        - cluster_entropy collapses towards zero
-        - top1_mass is moderate (< 0.60)
-        - distance_to_cluster is minimized (smaller than low beta and smaller than distance_to_nearest_memory)
-
-    HIGH beta:
-        - target_cluster_mass ~ 1.0
-        - top1_mass is dominant (> 0.80)
-        - entropy is low
-        - distance_to_nearest_memory collapses towards zero
     """
     config: dict[str, Any] = {
         "seed": 42,
