@@ -1,7 +1,11 @@
-"""Unit and integration tests for Hopfield cluster / metastable retrieval benchmark."""
+"""Unit and integration tests for Hopfield cluster retrieval benchmark."""
 
 from __future__ import annotations
 
+import csv
+import json
+import math
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -10,15 +14,19 @@ import pytest
 import torch
 
 from benchmarks.cluster_retrieval import (
+    classify_retrieval_regime,
     compute_cluster_masses,
     compute_cluster_metrics,
+    compute_dynamics_diagnostics,
     evaluate_cluster_retrieval,
     format_results_table,
     generate_cluster_centers,
     generate_clustered_memory,
     generate_queries,
+    main,
     plot_cluster_benchmark,
     run_benchmark,
+    save_reports,
     validate_cluster_config,
 )
 
@@ -50,7 +58,7 @@ def test_memory_bank_and_cluster_labels_shape() -> None:
 
 
 def test_generate_cluster_centers_separation() -> None:
-    """Verify cluster centers are well-separated."""
+    """Verify cluster centers have norm=separation and orthogonal distance=sqrt(2)*separation."""
     num_clusters = 4
     dim = 16
     sep = 3.0
@@ -58,12 +66,16 @@ def test_generate_cluster_centers_separation() -> None:
     centers = generate_cluster_centers(num_clusters, dim, separation=sep)
     assert centers.shape == (num_clusters, dim)
 
+    # Each center vector has Euclidean norm equal to sep
+    for i in range(num_clusters):
+        assert torch.linalg.vector_norm(centers[i]).item() == pytest.approx(sep, rel=1e-4)
+
     # In orthogonal frame, mutual distance between different centers is sqrt(2)*sep
     dists = torch.cdist(centers, centers)
     for i in range(num_clusters):
         for j in range(num_clusters):
             if i != j:
-                assert dists[i, j].item() > 0.5 * sep
+                assert dists[i, j].item() == pytest.approx(math.sqrt(2) * sep, rel=1e-4)
 
 
 def test_target_cluster_is_valid() -> None:
@@ -122,6 +134,11 @@ def test_evaluate_cluster_retrieval_direct() -> None:
     assert "target_cluster_mass" in metrics
     assert "distance_to_cluster" in metrics
     assert "distance_to_nearest_memory" in metrics
+    assert "dynamics_residual" in metrics
+    assert "perturbation_return_dist" in metrics
+    assert "regime" in metrics
+    assert "query_count" in metrics
+    assert "seed_count" in metrics
     assert metrics["target_cluster_mass"] > 0.90
     assert metrics["top1_in_target_cluster"] == 1.0
 
@@ -147,6 +164,107 @@ def test_compute_cluster_metrics_direct() -> None:
     assert metrics["top1_mass"].item() == pytest.approx(0.7)
     assert metrics["distance_to_cluster"].item() == pytest.approx(0.0)
     assert metrics["distance_to_nearest_memory"].item() == pytest.approx(0.0)
+    assert metrics["correct_cluster"].item() == 1.0
+    assert metrics["wrong_cluster"].item() == 0.0
+
+
+def test_classify_retrieval_regime_distribution_based() -> None:
+    """Verify classify_retrieval_regime classifies by distribution, independently of target."""
+    # 1. Single Memory concentration (top-1 >= 0.70)
+    assert classify_retrieval_regime(max_cluster_mass=1.0, top1_mass=1.0) == "Single Memory"
+    assert classify_retrieval_regime(max_cluster_mass=0.90, top1_mass=0.75) == "Single Memory"
+
+    # 2. Cluster Averaging concentration (max cluster mass >= 0.85, top-1 < 0.70)
+    assert classify_retrieval_regime(max_cluster_mass=0.95, top1_mass=0.20) == "Cluster Averaging"
+    assert classify_retrieval_regime(max_cluster_mass=0.85, top1_mass=0.50) == "Cluster Averaging"
+
+    # 3. Global Averaging (max cluster mass < 0.85 and top-1 < 0.70)
+    assert classify_retrieval_regime(max_cluster_mass=0.40, top1_mass=0.10) == "Global Averaging"
+    assert classify_retrieval_regime(max_cluster_mass=0.84, top1_mass=0.69) == "Global Averaging"
+
+
+def test_classify_retrieval_regime_wrong_cluster_concentration() -> None:
+    """Verify that concentration in a wrong cluster is NOT mislabeled as Global Averaging.
+
+    Even if target_cluster_mass is 0.0, if retrieval is concentrated on a single memory
+    in the wrong cluster, the regime is 'Single Memory', with wrong_cluster flagged.
+    """
+    memory = torch.tensor([
+        [10.0, 0.0],
+        [10.0, 0.1],
+        [0.0, 10.0],
+        [0.0, 10.1],
+    ])
+    cluster_labels = torch.tensor([0, 0, 1, 1])
+    centers = torch.tensor([
+        [10.0, 0.0],
+        [0.0, 10.0],
+    ])
+    # Query is close to cluster 1 (so retrieval concentrates on cluster 1)
+    queries = torch.tensor([
+        [0.0, 10.0],
+    ])
+    # But target cluster is erroneously specified as 0!
+    target_clusters = torch.tensor([0])
+
+    row = evaluate_cluster_retrieval(
+        queries=queries,
+        target_clusters=target_clusters,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        beta=10.0,
+    )
+
+    # Attention is concentrated on cluster 1 / memory in cluster 1
+    # Target cluster 0 receives near zero mass
+    assert row["target_cluster_mass"] < 0.01
+    assert row["wrong_cluster_mass"] > 0.99
+    # The concentration regime is Single Memory (NOT Global Averaging!)
+    assert row["regime"] == "Single Memory"
+    assert row["fraction_single_memory"] == 1.0
+    assert row["fraction_global_averaging"] == 0.0
+    # Correct vs wrong cluster metrics clearly separate correctness
+    assert row["correct_cluster_fraction"] == 0.0
+    assert row["wrong_cluster_fraction"] == 1.0
+    assert row["wrong_single_memory_fraction"] == 1.0
+
+
+def test_classify_retrieval_regime_mixed_outcomes() -> None:
+    """Verify per-query classification aggregates mixed regime fractions properly."""
+    memory = torch.tensor([
+        [6.0, 0.0],
+        [4.0, 0.0],
+        [0.0, 6.0],
+        [0.0, 4.0],
+    ])
+    cluster_labels = torch.tensor([0, 0, 1, 1])
+    centers = torch.tensor([
+        [5.0, 0.0],
+        [0.0, 5.0],
+    ])
+    # Query 1: sharp single memory concentration (closest to memory 0 [6.0, 0.0])
+    # Query 2: equidistant between clusters (diffuse global averaging)
+    queries = torch.tensor([
+        [5.0, 0.0],
+        [0.0, 0.0],
+    ])
+    target_clusters = torch.tensor([0, 0])
+
+    row = evaluate_cluster_retrieval(
+        queries=queries,
+        target_clusters=target_clusters,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        beta=5.0,
+    )
+
+    fractions = row["regime_fractions"]
+    assert fractions["Single Memory"] == 0.5
+    assert fractions["Global Averaging"] == 0.5
+    assert row["fraction_single_memory"] == 0.5
+    assert row["fraction_global_averaging"] == 0.5
 
 
 def test_attention_weights_and_cluster_masses_sum_to_one() -> None:
@@ -217,6 +335,8 @@ def test_metrics_are_finite_and_bounded() -> None:
             "distance_to_nearest_memory",
             "effective_memory_count",
             "effective_cluster_count",
+            "dynamics_residual",
+            "perturbation_return_dist",
         ]:
             val = r[key]
             assert isinstance(val, (int, float))
@@ -233,6 +353,7 @@ def test_metrics_are_finite_and_bounded() -> None:
         assert 0.0 <= r["top1_in_target_cluster"] <= 1.0
         assert r["effective_memory_count"] >= 1.0 - 1e-4
         assert r["effective_cluster_count"] >= 1.0 - 1e-4
+        assert r["dynamics_residual"] >= 0.0
 
 
 def test_reproducibility_with_same_seed() -> None:
@@ -262,11 +383,11 @@ def test_reproducibility_with_same_seed() -> None:
         assert r1["cluster_entropy"] == pytest.approx(r2["cluster_entropy"])
         assert r1["distance_to_cluster"] == pytest.approx(r2["distance_to_cluster"])
         assert r1["distance_to_nearest_memory"] == pytest.approx(r2["distance_to_nearest_memory"])
+        assert r1["dynamics_residual"] == pytest.approx(r2["dynamics_residual"])
 
 
-def test_scientific_transition_across_regimes() -> None:
-    """Scientific acceptance test: verifies the three retrieval regimes.
-    """
+def test_scientific_transition_across_regimes_controlled_example() -> None:
+    """Controlled example verifying the three qualitative retrieval regimes under standard geometry."""
     config: dict[str, Any] = {
         "seed": 42,
         "dim": 64,
@@ -290,20 +411,22 @@ def test_scientific_transition_across_regimes() -> None:
     assert low_res["target_cluster_mass"] < 0.50
     assert low_res["top1_mass"] < 0.10
     assert low_res["entropy"] > 3.0
+    assert low_res["regime"] == "Global Averaging"
 
-    # Medium beta: cluster / metastable retrieval
+    # Medium beta: cluster averaging
     assert med_res["target_cluster_mass"] > 0.95
     assert med_res["top1_mass"] < 0.50
     assert med_res["cluster_entropy"] < 0.10
-    # Crucial scientific signature of cluster state:
-    # Retrieved vector is closer to the cluster center prototype than to any individual memory!
+    # Closer to cluster generating prototype than to any individual stored memory:
     assert med_res["distance_to_cluster"] < med_res["distance_to_nearest_memory"]
+    assert med_res["regime"] == "Cluster Averaging"
 
-    # High beta: single memory retrieval
+    # High beta: single memory concentration
     assert high_res["target_cluster_mass"] > 0.99
     assert high_res["top1_mass"] > 0.90
     assert high_res["entropy"] < 0.30
     assert high_res["distance_to_nearest_memory"] < 0.15
+    assert high_res["regime"] == "Single Memory"
 
     # Monotonic trends
     assert high_res["top1_mass"] > med_res["top1_mass"] > low_res["top1_mass"]
@@ -311,11 +434,112 @@ def test_scientific_transition_across_regimes() -> None:
     assert low_res["distance_to_nearest_memory"] > high_res["distance_to_nearest_memory"]
 
 
-def test_multi_seed_aggregation() -> None:
-    """Verify benchmark supports running and aggregating multiple random seeds."""
+def test_negative_control_zero_within_cluster_noise() -> None:
+    """Negative control: zero intra-cluster noise creates duplicate memories that beta cannot distinguish.
+
+    When cluster_noise == 0.0, all memories in a cluster are identical duplicates.
+    Attention within the cluster is uniformly divided across all memories (1 / memories_per_cluster),
+    meaning top-1 mass can never exceed 1 / memories_per_cluster regardless of how high beta is!
+    """
+    mem_per_cluster = 10
     config: dict[str, Any] = {
         "seed": 42,
-        "seeds": [10, 20, 30],
+        "dim": 32,
+        "num_clusters": 3,
+        "memories_per_cluster": mem_per_cluster,
+        "cluster_separation": 3.0,
+        "cluster_noise": 0.0,  # Duplicate memories within cluster
+        "query_noise": 0.05,
+        "num_queries": 20,
+        "target_cluster": 0,
+        "beta_values": [0.1, 1.0, 10.0, 100.0],
+        "save_plot": False,
+    }
+
+    results, _ = run_benchmark(config, save_plot=False)
+
+    expected_max_top1 = 1.0 / mem_per_cluster  # 0.10
+
+    for r in results:
+        # top1_mass is strictly bounded by 1 / memories_per_cluster
+        assert r["top1_mass"] <= expected_max_top1 + 1e-4
+        # Single Memory regime is NEVER reached because duplicate memories cannot be distinguished
+        assert r["regime"] != "Single Memory"
+        assert r["fraction_single_memory"] == 0.0
+
+
+def test_one_step_vs_repeated_dynamics() -> None:
+    """Test iterative Hopfield dynamics: fixed-point residual and perturbation stability."""
+    memory, cluster_labels, centers = generate_clustered_memory(
+        num_clusters=4,
+        memories_per_cluster=8,
+        dim=32,
+        cluster_separation=3.0,
+        cluster_noise=0.15,
+        generator=torch.Generator().manual_seed(42),
+    )
+    queries, targets = generate_queries(
+        cluster_centers=centers,
+        target_cluster=0,
+        num_queries=15,
+        query_noise=0.10,
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    # 1-step retrieval vs 5-step repeated retrieval at high beta
+    res_step1 = evaluate_cluster_retrieval(
+        queries=queries,
+        target_clusters=targets,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        beta=20.0,
+        num_updates=1,
+    )
+
+    res_step5 = evaluate_cluster_retrieval(
+        queries=queries,
+        target_clusters=targets,
+        memory=memory,
+        cluster_centers=centers,
+        cluster_labels=cluster_labels,
+        beta=20.0,
+        num_updates=5,
+    )
+
+    # Both report dynamics diagnostics
+    assert "dynamics_residual" in res_step1
+    assert "dynamics_residual" in res_step5
+    assert "perturbation_return_dist" in res_step5
+
+    # Multi-step relaxation at high beta drives the residual ||R(q_T) - q_T|| toward 0
+    assert res_step5["dynamics_residual"] <= res_step1["dynamics_residual"] + 1e-4
+    assert res_step5["dynamics_residual"] < 0.05
+
+    # Direct test of compute_dynamics_diagnostics on relaxed attractor states:
+    from hopfieldpc.functional import multi_step_retrieve
+    relaxed_attractors, _ = multi_step_retrieve(
+        queries[0:4],
+        memory,
+        beta=20.0,
+        num_updates=10,
+    )
+    diag = compute_dynamics_diagnostics(
+        retrieved=relaxed_attractors,
+        memory=memory,
+        beta=20.0,
+    )
+    # The relaxed state is a stationary fixed point: residual ||R(q*) - q*|| == 0
+    assert diag["dynamics_residual"].mean().item() == pytest.approx(0.0, abs=1e-3)
+    # Perturbations contract back toward the attractor
+    assert diag["perturbation_return_dist"].mean().item() < diag["perturbation_init_dist"].mean().item()
+
+
+def test_multi_seed_uncertainty_consistency() -> None:
+    """Verify explicit query_std and seed_std fields across single and multi-seed configurations."""
+    # Single-seed run
+    single_cfg: dict[str, Any] = {
+        "seed": 42,
         "dim": 16,
         "num_clusters": 3,
         "memories_per_cluster": 5,
@@ -327,24 +551,47 @@ def test_multi_seed_aggregation() -> None:
         "beta_values": [0.1, 2.0],
         "save_plot": False,
     }
+    single_res, single_meta = run_benchmark(single_cfg, save_plot=False)
+    assert single_meta["num_queries"] == 10
+    for r in single_res:
+        assert r["seed_count"] == 1
+        assert r["query_count"] == 10
+        assert "target_cluster_mass_query_std" in r
+        assert "target_cluster_mass_seed_std" in r
+        assert r["target_cluster_mass_seed_std"] == 0.0
+        assert r["target_cluster_mass_query_std"] >= 0.0
 
-    results, meta = run_benchmark(config, save_plot=False)
-    assert meta["num_seeds"] == 3
-    assert len(results) == 2
-
-    for r in results:
-        assert "target_cluster_mass_std" in r
-        assert "distance_to_cluster_std" in r
-        assert r["target_cluster_mass_std"] >= 0.0
+    # Multi-seed run
+    multi_cfg: dict[str, Any] = {
+        **single_cfg,
+        "seeds": [10, 20, 30],
+    }
+    multi_res, multi_meta = run_benchmark(multi_cfg, save_plot=False)
+    assert multi_meta["num_seeds"] == 3
+    for r in multi_res:
+        assert r["seed_count"] == 3
+        assert r["query_count"] == 10
+        assert "target_cluster_mass_seed_std" in r
+        assert "target_cluster_mass_query_std" in r
+        assert r["target_cluster_mass_seed_std"] >= 0.0
+        assert r["target_cluster_mass_query_std"] >= 0.0
 
 
 def test_config_validation_errors() -> None:
-    """Verify clear ValueErrors for invalid configuration parameters."""
+    """Verify clear ValueErrors for invalid configuration parameters including NaN, Inf, and non-booleans."""
+    # Non-mapping
+    with pytest.raises(TypeError, match="Configuration must be a dictionary/mapping"):
+        validate_cluster_config("invalid")  # type: ignore
+
     with pytest.raises(ValueError, match="seed must be a non-negative integer"):
         validate_cluster_config({"seed": -1})
+    with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+        validate_cluster_config({"seed": True})
 
     with pytest.raises(ValueError, match="dim must be a positive integer"):
         validate_cluster_config({"dim": 0})
+    with pytest.raises(ValueError, match="dim must be a positive integer"):
+        validate_cluster_config({"dim": True})
 
     with pytest.raises(ValueError, match="num_clusters must be an integer >= 2"):
         validate_cluster_config({"num_clusters": 1})
@@ -352,27 +599,129 @@ def test_config_validation_errors() -> None:
     with pytest.raises(ValueError, match="memories_per_cluster must be an integer >= 2"):
         validate_cluster_config({"memories_per_cluster": 1})
 
-    with pytest.raises(ValueError, match="cluster_separation must be a positive number"):
+    # cluster_separation finite checks
+    with pytest.raises(ValueError, match="cluster_separation must be a positive finite number"):
         validate_cluster_config({"cluster_separation": 0.0})
+    with pytest.raises(ValueError, match="cluster_separation must be a positive finite number"):
+        validate_cluster_config({"cluster_separation": float("nan")})
+    with pytest.raises(ValueError, match="cluster_separation must be a positive finite number"):
+        validate_cluster_config({"cluster_separation": float("inf")})
 
-    with pytest.raises(ValueError, match="cluster_noise must be a non-negative number"):
+    # cluster_noise finite checks
+    with pytest.raises(ValueError, match="cluster_noise must be a non-negative finite number"):
         validate_cluster_config({"cluster_noise": -0.1})
+    with pytest.raises(ValueError, match="cluster_noise must be a non-negative finite number"):
+        validate_cluster_config({"cluster_noise": float("nan")})
+    with pytest.raises(ValueError, match="cluster_noise must be a non-negative finite number"):
+        validate_cluster_config({"cluster_noise": float("inf")})
 
-    with pytest.raises(ValueError, match="query_noise must be a non-negative number"):
+    # query_noise finite checks
+    with pytest.raises(ValueError, match="query_noise must be a non-negative finite number"):
         validate_cluster_config({"query_noise": -0.1})
+    with pytest.raises(ValueError, match="query_noise must be a non-negative finite number"):
+        validate_cluster_config({"query_noise": float("nan")})
 
     with pytest.raises(ValueError, match="target_cluster must be an integer in"):
         validate_cluster_config({"num_clusters": 4, "target_cluster": 5})
 
+    # beta_values checks (reused Task 12 validator)
     with pytest.raises(ValueError, match="beta_values must be a non-empty list"):
         validate_cluster_config({"beta_values": []})
-
-    with pytest.raises(ValueError, match="All beta_values must be positive"):
+    with pytest.raises(ValueError, match="All beta_values must be positive numbers"):
         validate_cluster_config({"beta_values": [1.0, -0.5]})
+    with pytest.raises(ValueError, match="All beta_values must be positive numbers"):
+        validate_cluster_config({"beta_values": [float("nan")]})
+    with pytest.raises(ValueError, match="All beta_values must be positive numbers"):
+        validate_cluster_config({"beta_values": [float("inf")]})
+
+    # Genuine boolean checks (prevent bool("false") -> True trap)
+    with pytest.raises(ValueError, match="normalize must be a genuine boolean"):
+        validate_cluster_config({"normalize": "false"})
+    with pytest.raises(ValueError, match="save_plot must be a genuine boolean"):
+        validate_cluster_config({"save_plot": "false"})
+
+    with pytest.raises(ValueError, match="num_updates must be a positive integer"):
+        validate_cluster_config({"num_updates": 0})
+    with pytest.raises(ValueError, match="num_updates must be a positive integer"):
+        validate_cluster_config({"num_updates": True})
 
 
-def test_save_reports_and_plot() -> None:
-    """Verify reports (JSON, CSV) and diagnostic plot are correctly generated and saved."""
+def test_missing_config_file_raises_filenotfound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that an explicitly missing config file fails clearly with FileNotFoundError."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cluster_retrieval.py", "--config", "non_existent_config_file.yaml"],
+    )
+    with pytest.raises(FileNotFoundError, match="Configuration file not found"):
+        main()
+
+
+def test_save_reports_preserves_uncertainty() -> None:
+    """Verify save_reports preserves all uncertainty fields and per-seed results into CSV and JSON."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        config: dict[str, Any] = {
+            "seed": 42,
+            "seeds": [11, 22],
+            "dim": 16,
+            "num_clusters": 3,
+            "memories_per_cluster": 5,
+            "cluster_separation": 2.5,
+            "cluster_noise": 0.1,
+            "query_noise": 0.05,
+            "num_queries": 10,
+            "target_cluster": 0,
+            "beta_values": [0.1, 1.0],
+            "save_plot": False,
+        }
+
+        results, meta = run_benchmark(config, save_plot=False)
+        save_reports(
+            results,
+            output_dir=out_dir,
+            metadata=meta,
+            per_seed_results=[results, results],
+        )
+
+        json_path = out_dir / "results.json"
+        csv_path = out_dir / "results.csv"
+        per_seed_csv = out_dir / "per_seed_results.csv"
+
+        assert json_path.exists()
+        assert csv_path.exists()
+        assert per_seed_csv.exists()
+
+        # Check JSON contains results, metadata, and per_seed_results
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        assert "metadata" in payload
+        assert "results" in payload
+        assert "per_seed_results" in payload
+        assert len(payload["per_seed_results"]) == 2
+
+        # Check CSV preserves uncertainty columns (NOT dropped by fixed fieldnames)
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        assert len(rows) == 2
+        for row in rows:
+            assert "target_cluster_mass" in row
+            assert "target_cluster_mass_seed_std" in row
+            assert "target_cluster_mass_query_std" in row
+            assert "dynamics_residual" in row
+            assert "fraction_cluster_averaging" in row
+            assert "seed_count" in row
+            assert "query_count" in row
+            # Verify values are populated numbers, not empty strings
+            assert float(row["target_cluster_mass_seed_std"]) >= 0.0
+            assert float(row["target_cluster_mass_query_std"]) >= 0.0
+
+
+def test_plot_cluster_benchmark_generation() -> None:
+    """Verify plot generation produces a valid non-empty PNG when Matplotlib is present."""
+    pytest.importorskip("matplotlib")
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
         config: dict[str, Any] = {
@@ -390,17 +739,49 @@ def test_save_reports_and_plot() -> None:
         }
 
         results, meta = run_benchmark(config, output_dir=out_dir, save_plot=True)
-
-        assert (out_dir / "results.json").exists()
-        assert (out_dir / "results.csv").exists()
-        assert (out_dir / "cluster_retrieval.png").exists()
-
-        # Check plot function directly
-        plot_path = out_dir / "custom_plot.png"
-        success = plot_cluster_benchmark(results, plot_path, cfg=meta)
-        assert success is True
+        plot_path = out_dir / "cluster_retrieval.png"
         assert plot_path.exists()
         assert plot_path.stat().st_size > 1000
+
+        # Direct call test
+        custom_plot = out_dir / "direct_plot.png"
+        success = plot_cluster_benchmark(results, custom_plot, cfg=meta)
+        assert success is True
+        assert custom_plot.exists()
+        assert custom_plot.stat().st_size > 1000
+
+
+def test_plot_fallback_when_matplotlib_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify plot_cluster_benchmark gracefully warns and returns False when Matplotlib is absent."""
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if "matplotlib" in name:
+            raise ImportError("Simulated missing matplotlib")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dummy_path = Path(tmpdir) / "test.png"
+        sample_results = [
+            {
+                "beta": 1.0,
+                "target_cluster_mass": 0.9,
+                "top1_mass": 0.2,
+                "entropy": 2.0,
+                "cluster_entropy": 0.1,
+                "distance_to_cluster": 0.5,
+                "distance_to_nearest_memory": 1.5,
+            }
+        ]
+
+        with pytest.warns(UserWarning, match="matplotlib is not installed"):
+            result = plot_cluster_benchmark(sample_results, dummy_path)
+
+        assert result is False
+        assert not dummy_path.exists()
 
 
 def test_format_results_table() -> None:

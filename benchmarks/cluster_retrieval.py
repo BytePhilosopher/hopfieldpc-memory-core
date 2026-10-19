@@ -1,11 +1,12 @@
-"""Cluster and metastable retrieval benchmark for modern Hopfield memory.
-"""
+"""Cluster retrieval benchmark for modern Hopfield memory."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -13,21 +14,37 @@ from typing import Any
 import torch
 import yaml
 
+# Ensure project root is in sys.path when script is executed directly
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from benchmarks.beta_sweep import validate_beta_values
 from hopfieldpc.diagnostics import (
     argmax_memory_index,
     attention_entropy,
     max_attention_weight,
     retrieval_distance,
 )
-from hopfieldpc.functional import multi_step_retrieve
+from hopfieldpc.functional import hopfield_retrieve, multi_step_retrieve
 
 DEFAULT_BETAS = [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
 
 def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize configuration parameters for cluster retrieval."""
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"Configuration must be a dictionary/mapping, got {type(config).__name__}."
+        )
+
     seed = config.get("seed", 42)
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not math.isfinite(seed)
+        or seed < 0
+    ):
         raise ValueError(f"seed must be a non-negative integer, got {seed!r}.")
 
     seeds_raw = config.get("seeds", None)
@@ -37,22 +54,38 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("seeds must be a non-empty list of non-negative integers.")
         resolved_seeds = []
         for s in seeds_raw:
-            if isinstance(s, bool) or not isinstance(s, int) or s < 0:
+            if (
+                isinstance(s, bool)
+                or not isinstance(s, int)
+                or not math.isfinite(s)
+                or s < 0
+            ):
                 raise ValueError(f"All seeds must be non-negative integers, got {s!r}.")
             resolved_seeds.append(s)
 
     dim = config.get("dim", 64)
-    if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
+    if (
+        isinstance(dim, bool)
+        or not isinstance(dim, int)
+        or not math.isfinite(dim)
+        or dim <= 0
+    ):
         raise ValueError(f"dim must be a positive integer, got {dim!r}.")
 
     num_clusters = config.get("num_clusters", 4)
-    if isinstance(num_clusters, bool) or not isinstance(num_clusters, int) or num_clusters < 2:
+    if (
+        isinstance(num_clusters, bool)
+        or not isinstance(num_clusters, int)
+        or not math.isfinite(num_clusters)
+        or num_clusters < 2
+    ):
         raise ValueError(f"num_clusters must be an integer >= 2, got {num_clusters!r}.")
 
     memories_per_cluster = config.get("memories_per_cluster", 10)
     if (
         isinstance(memories_per_cluster, bool)
         or not isinstance(memories_per_cluster, int)
+        or not math.isfinite(memories_per_cluster)
         or memories_per_cluster < 2
     ):
         raise ValueError(
@@ -63,10 +96,11 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
     if (
         isinstance(cluster_separation, bool)
         or not isinstance(cluster_separation, (int, float))
+        or not math.isfinite(cluster_separation)
         or cluster_separation <= 0
     ):
         raise ValueError(
-            f"cluster_separation must be a positive number, got {cluster_separation!r}."
+            f"cluster_separation must be a positive finite number, got {cluster_separation!r}."
         )
     cluster_separation = float(cluster_separation)
 
@@ -74,28 +108,36 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
     if (
         isinstance(cluster_noise, bool)
         or not isinstance(cluster_noise, (int, float))
+        or not math.isfinite(cluster_noise)
         or cluster_noise < 0
     ):
-        raise ValueError(f"cluster_noise must be a non-negative number, got {cluster_noise!r}.")
+        raise ValueError(f"cluster_noise must be a non-negative finite number, got {cluster_noise!r}.")
     cluster_noise = float(cluster_noise)
 
     query_noise = config.get("query_noise", 0.10)
     if (
         isinstance(query_noise, bool)
         or not isinstance(query_noise, (int, float))
+        or not math.isfinite(query_noise)
         or query_noise < 0
     ):
-        raise ValueError(f"query_noise must be a non-negative number, got {query_noise!r}.")
+        raise ValueError(f"query_noise must be a non-negative finite number, got {query_noise!r}.")
     query_noise = float(query_noise)
 
     num_queries = config.get("num_queries", 50)
-    if isinstance(num_queries, bool) or not isinstance(num_queries, int) or num_queries <= 0:
+    if (
+        isinstance(num_queries, bool)
+        or not isinstance(num_queries, int)
+        or not math.isfinite(num_queries)
+        or num_queries <= 0
+    ):
         raise ValueError(f"num_queries must be a positive integer, got {num_queries!r}.")
 
     target_cluster = config.get("target_cluster", 0)
     if target_cluster is not None and (
         isinstance(target_cluster, bool)
         or not isinstance(target_cluster, int)
+        or not math.isfinite(target_cluster)
         or target_cluster < 0
         or target_cluster >= num_clusters
     ):
@@ -103,24 +145,38 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
             f"target_cluster must be an integer in [0, {num_clusters - 1}], got {target_cluster!r}."
         )
 
+    # Reuse shared beta validator from Task 12
     beta_values = config.get("beta_values", DEFAULT_BETAS)
-    if not isinstance(beta_values, list) or len(beta_values) == 0:
-        raise ValueError("beta_values must be a non-empty list of positive numbers.")
+    resolved_betas = validate_beta_values(beta_values)
 
-    resolved_betas: list[float] = []
-    for b in beta_values:
-        if isinstance(b, bool) or not isinstance(b, (int, float)) or b <= 0:
-            raise ValueError(f"All beta_values must be positive numbers, got {b!r}.")
-        resolved_betas.append(float(b))
+    if "normalize" in config:
+        if not isinstance(config["normalize"], bool):
+            raise ValueError(
+                f"normalize must be a genuine boolean (True/False), got {config['normalize']!r}."
+            )
+        normalize = config["normalize"]
+    else:
+        normalize = False
 
-    normalize = bool(config.get("normalize", False))
+    if "save_plot" in config:
+        if not isinstance(config["save_plot"], bool):
+            raise ValueError(
+                f"save_plot must be a genuine boolean (True/False), got {config['save_plot']!r}."
+            )
+        save_plot = config["save_plot"]
+    else:
+        save_plot = True
 
     num_updates = config.get("num_updates", 1)
-    if isinstance(num_updates, bool) or not isinstance(num_updates, int) or num_updates <= 0:
+    if (
+        isinstance(num_updates, bool)
+        or not isinstance(num_updates, int)
+        or not math.isfinite(num_updates)
+        or num_updates <= 0
+    ):
         raise ValueError(f"num_updates must be a positive integer, got {num_updates!r}.")
 
     reports_dir = config.get("reports_dir", "reports/cluster_retrieval")
-    save_plot = bool(config.get("save_plot", True))
 
     return {
         "seed": seed,
@@ -147,13 +203,16 @@ def generate_cluster_centers(
     separation: float,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Generate clearly separated cluster centers in feature space.
+    """Generate clearly separated cluster center prototypes in feature space.
 
-    When num_clusters <= dim, cluster centers are constructed from an orthogonal
-    frame (via QR decomposition) scaled by separation. This mathematically guarantees
-    equidistant, non-overlapping cluster centers with zero mutual dot product.
-    When num_clusters > dim, centers are normalized random Gaussian vectors
-    scaled by separation.
+    Geometry note:
+        `separation` defines the Euclidean norm (vector length) of each prototype.
+        When num_clusters <= dim, cluster centers are constructed from an orthonormal
+        frame (via QR decomposition) scaled by separation. For any two distinct orthogonal
+        centers c_i and c_j, their Euclidean distance is sqrt(2) * separation:
+            ||c_i - c_j||_2 = sqrt(||c_i||^2 + ||c_j||^2) = sqrt(2) * separation.
+        When num_clusters > dim, centers are normalized random Gaussian vectors
+        scaled by separation.
     """
     if num_clusters <= dim:
         random_matrix = torch.randn(dim, num_clusters, generator=generator)
@@ -178,12 +237,17 @@ def generate_clustered_memory(
 
     Formula:
         M_{c, j} = center_c + noise_{c, j}
-        where noise ~ N(0, cluster_noise^2 * I)
+        where center_c has norm cluster_separation and noise ~ N(0, cluster_noise^2 * I).
+
+    Geometry note:
+        Distinct orthogonal cluster centers have Euclidean distance sqrt(2) * cluster_separation.
+        Individual memories fluctuate around their respective prototype center_c.
+        If cluster_noise == 0.0, memories within each cluster are identical duplicates.
 
     Returns:
         memory: Tensor with shape [num_memories, dim].
         cluster_labels: LongTensor with shape [num_memories] containing cluster IDs.
-        cluster_centers: Tensor with shape [num_clusters, dim].
+        cluster_centers: Tensor with shape [num_clusters, dim] containing prototype centers.
     """
     centers = generate_cluster_centers(
         num_clusters=num_clusters,
@@ -221,19 +285,7 @@ def generate_queries(
     query_noise: float,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate evaluation queries near designated target clusters.
-
-    Args:
-        cluster_centers: Tensor of cluster centers [num_clusters, dim].
-        target_cluster: Specific target cluster index, or None for uniform sampling.
-        num_queries: Number of query vectors to produce.
-        query_noise: Standard deviation of Gaussian perturbation around cluster center.
-        generator: Optional PyTorch random number generator.
-
-    Returns:
-        queries: Tensor of shape [num_queries, dim].
-        query_targets: LongTensor of shape [num_queries] with ground-truth cluster IDs.
-    """
+    """Generate evaluation queries near designated target cluster prototypes."""
     num_clusters, dim = cluster_centers.shape
 
     if target_cluster is not None:
@@ -270,17 +322,7 @@ def compute_cluster_masses(
     cluster_labels: torch.Tensor,
     num_clusters: int,
 ) -> torch.Tensor:
-    """Compute attention mass assigned to each cluster.
-
-    Args:
-        weights: Softmax retrieval weights [batch_size, num_memories].
-        cluster_labels: Cluster membership per memory [num_memories].
-        num_clusters: Total number of clusters.
-
-    Returns:
-        Tensor of shape [batch_size, num_clusters] where entry [i, c] is the sum
-        of attention weights assigned to memories belonging to cluster c.
-    """
+    """Compute attention mass assigned to each cluster."""
     batch_size, num_memories = weights.shape
     if cluster_labels.shape[0] != num_memories:
         raise ValueError(
@@ -302,6 +344,76 @@ def compute_cluster_masses(
     return cluster_masses
 
 
+def compute_dynamics_diagnostics(
+    retrieved: torch.Tensor,
+    memory: torch.Tensor,
+    beta: float,
+    normalize: bool = False,
+    perturbation_noise: float = 0.05,
+    perturbation_steps: int = 3,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compute iterative dynamics diagnostics for candidate retrieved states."""
+    next_step, _ = hopfield_retrieve(
+        query=retrieved,
+        memory=memory,
+        beta=beta,
+        normalize=normalize,
+    )
+    residual = retrieval_distance(next_step, retrieved, p=2.0)
+
+    delta = torch.randn(
+        retrieved.shape,
+        generator=generator,
+        dtype=retrieved.dtype,
+        device=retrieved.device,
+    ) * perturbation_noise
+    perturbed_q = retrieved + delta
+    init_dist = retrieval_distance(perturbed_q, retrieved, p=2.0).clamp_min(1e-8)
+
+    relaxed_state, _ = multi_step_retrieve(
+        query=perturbed_q,
+        memory=memory,
+        beta=beta,
+        num_updates=perturbation_steps,
+        normalize=normalize,
+    )
+    return_dist = retrieval_distance(relaxed_state, retrieved, p=2.0)
+    contraction_ratio = return_dist / init_dist
+
+    return {
+        "dynamics_residual": residual,
+        "perturbation_return_dist": return_dist,
+        "perturbation_init_dist": init_dist,
+        "perturbation_contraction_ratio": contraction_ratio,
+    }
+
+
+def classify_retrieval_regime(
+    max_cluster_mass: float | None = None,
+    top1_mass: float | None = None,
+    *,
+    single_memory_threshold: float = 0.70,
+    cluster_threshold: float = 0.85,
+    target_cluster_mass: float | None = None,
+    num_clusters: int | None = None,
+    memories_per_cluster: int | None = None,
+) -> str:
+    """Classify the concentration regime of a retrieval distribution independently of target correctness."""
+    c_mass = max_cluster_mass if max_cluster_mass is not None else target_cluster_mass
+    if c_mass is None:
+        raise ValueError("Must provide max_cluster_mass (or target_cluster_mass).")
+    if top1_mass is None:
+        raise ValueError("Must provide top1_mass.")
+
+    if top1_mass >= single_memory_threshold:
+        return "Single Memory"
+    elif c_mass >= cluster_threshold:
+        return "Cluster Averaging"
+    else:
+        return "Global Averaging"
+
+
 def compute_cluster_metrics(
     retrieved: torch.Tensor,
     weights: torch.Tensor,
@@ -309,35 +421,16 @@ def compute_cluster_metrics(
     cluster_centers: torch.Tensor,
     cluster_labels: torch.Tensor,
     target_clusters: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Compute per-query cluster retrieval diagnostics across all metric dimensions.
-
-    Args:
-        retrieved: Retrieved memory vectors [batch_size, dim].
-        weights: Softmax attention weights [batch_size, num_memories].
-        memory: Stored memory bank [num_memories, dim].
-        cluster_centers: Cluster prototype vectors [num_clusters, dim].
-        cluster_labels: Cluster assignment per memory [num_memories].
-        target_clusters: Ground truth target cluster per query [batch_size].
-
-    Returns:
-        Dictionary of per-query metric tensors:
-            - target_cluster_mass: Probability mass allocated to the target cluster [batch_size]
-            - all_cluster_masses: Probability mass per cluster [batch_size, num_clusters]
-            - top1_mass: Highest single memory attention weight [batch_size]
-            - entropy: Shannon entropy of memory-level attention distribution [batch_size]
-            - cluster_entropy: Shannon entropy of cluster-level probability distribution [batch_size]
-            - distance_to_cluster: Euclidean distance to target cluster center [batch_size]
-            - distance_to_nearest_memory: Minimum Euclidean distance to any stored memory [batch_size]
-            - top1_in_target_cluster: Binary indicator whether top-1 memory is in target cluster [batch_size]
-            - effective_memory_count: Inverse participation ratio 1 / sum(w_i^2) [batch_size]
-            - effective_cluster_count: Inverse participation ratio 1 / sum(c_k^2) [batch_size]
-    """
+) -> dict[str, Any]:
+    """Compute per-query cluster retrieval diagnostics across all metric dimensions."""
     num_clusters = cluster_centers.shape[0]
     cluster_masses = compute_cluster_masses(weights, cluster_labels, num_clusters)
 
     batch_indices = torch.arange(retrieved.shape[0], device=retrieved.device)
     target_cluster_mass = cluster_masses[batch_indices, target_clusters]
+    wrong_cluster_mass = 1.0 - target_cluster_mass
+
+    max_cluster_mass, argmax_cluster = cluster_masses.max(dim=-1)
 
     top1 = max_attention_weight(weights)
     mem_entropy = attention_entropy(weights)
@@ -346,7 +439,6 @@ def compute_cluster_metrics(
     target_centers = cluster_centers[target_clusters]
     dist_cluster = retrieval_distance(retrieved, target_centers, p=2.0)
 
-    # Minimum distance to any stored memory vector
     pairwise_distances = torch.cdist(retrieved, memory, p=2.0)
     dist_nearest_memory = pairwise_distances.min(dim=-1).values
 
@@ -354,23 +446,52 @@ def compute_cluster_metrics(
     top1_clusters = cluster_labels[top1_indices]
     top1_in_target = (top1_clusters == target_clusters).float()
 
+    correct_cluster = (argmax_cluster == target_clusters).float()
+    wrong_cluster = (argmax_cluster != target_clusters).float()
+
+    wrong_cluster_concentration = (
+        (max_cluster_mass >= 0.85) & (argmax_cluster != target_clusters)
+    ).float()
+    correct_cluster_concentration = (
+        (max_cluster_mass >= 0.85) & (argmax_cluster == target_clusters)
+    ).float()
+    wrong_single_memory = ((top1 >= 0.70) & (top1_clusters != target_clusters)).float()
+    correct_single_memory = ((top1 >= 0.70) & (top1_clusters == target_clusters)).float()
+
     weights_sq_sum = (weights ** 2).sum(dim=-1).clamp_min(1e-12)
     effective_memories = 1.0 / weights_sq_sum
 
     cluster_masses_sq_sum = (cluster_masses ** 2).sum(dim=-1).clamp_min(1e-12)
     effective_clusters = 1.0 / cluster_masses_sq_sum
 
+    query_regimes: list[str] = []
+    for i in range(retrieved.shape[0]):
+        r = classify_retrieval_regime(
+            max_cluster_mass=max_cluster_mass[i].item(),
+            top1_mass=top1[i].item(),
+        )
+        query_regimes.append(r)
+
     return {
         "target_cluster_mass": target_cluster_mass,
+        "wrong_cluster_mass": wrong_cluster_mass,
         "all_cluster_masses": cluster_masses,
+        "max_cluster_mass": max_cluster_mass,
         "top1_mass": top1,
         "entropy": mem_entropy,
         "cluster_entropy": clus_entropy,
         "distance_to_cluster": dist_cluster,
         "distance_to_nearest_memory": dist_nearest_memory,
         "top1_in_target_cluster": top1_in_target,
+        "correct_cluster": correct_cluster,
+        "wrong_cluster": wrong_cluster,
+        "wrong_cluster_concentration": wrong_cluster_concentration,
+        "correct_cluster_concentration": correct_cluster_concentration,
+        "wrong_single_memory": wrong_single_memory,
+        "correct_single_memory": correct_single_memory,
         "effective_memory_count": effective_memories,
         "effective_cluster_count": effective_clusters,
+        "query_regimes": query_regimes,
     }
 
 
@@ -384,6 +505,8 @@ def evaluate_cluster_retrieval(
     beta: float,
     num_updates: int = 1,
     normalize: bool = False,
+    compute_dynamics: bool = True,
+    generator: torch.Generator | None = None,
 ) -> dict[str, Any]:
     """Execute Hopfield retrieval with specified beta and calculate aggregated cluster metrics."""
     if beta <= 0:
@@ -419,41 +542,80 @@ def evaluate_cluster_retrieval(
     if not torch.allclose(cluster_masses_sum, torch.ones_like(cluster_masses_sum), atol=1e-4):
         raise ValueError(f"Cluster masses do not sum to 1 for beta={beta}.")
 
-    return {
-        "beta": beta,
-        "target_cluster_mass": metrics["target_cluster_mass"].mean().item(),
-        "target_cluster_mass_std": metrics["target_cluster_mass"].std().item() if queries.shape[0] > 1 else 0.0,
-        "top1_mass": metrics["top1_mass"].mean().item(),
-        "top1_mass_std": metrics["top1_mass"].std().item() if queries.shape[0] > 1 else 0.0,
-        "entropy": metrics["entropy"].mean().item(),
-        "entropy_std": metrics["entropy"].std().item() if queries.shape[0] > 1 else 0.0,
-        "cluster_entropy": metrics["cluster_entropy"].mean().item(),
-        "distance_to_cluster": metrics["distance_to_cluster"].mean().item(),
-        "distance_to_cluster_std": metrics["distance_to_cluster"].std().item() if queries.shape[0] > 1 else 0.0,
-        "distance_to_nearest_memory": metrics["distance_to_nearest_memory"].mean().item(),
-        "distance_to_nearest_memory_std": metrics["distance_to_nearest_memory"].std().item() if queries.shape[0] > 1 else 0.0,
-        "top1_in_target_cluster": metrics["top1_in_target_cluster"].mean().item(),
-        "effective_memory_count": metrics["effective_memory_count"].mean().item(),
-        "effective_cluster_count": metrics["effective_cluster_count"].mean().item(),
+    num_q = queries.shape[0]
+
+    # Iterative dynamics checks
+    if compute_dynamics:
+        dynamics = compute_dynamics_diagnostics(
+            retrieved=retrieved,
+            memory=memory,
+            beta=beta,
+            normalize=normalize,
+            generator=generator,
+        )
+    else:
+        dynamics = {
+            "dynamics_residual": torch.zeros(num_q, device=retrieved.device),
+            "perturbation_return_dist": torch.zeros(num_q, device=retrieved.device),
+            "perturbation_contraction_ratio": torch.zeros(num_q, device=retrieved.device),
+        }
+
+    # Aggregate regime fractions from per-query classifications
+    regimes = metrics["query_regimes"]
+    frac_global = sum(1 for r in regimes if r == "Global Averaging") / num_q
+    frac_cluster = sum(1 for r in regimes if r == "Cluster Averaging") / num_q
+    frac_single = sum(1 for r in regimes if r == "Single Memory") / num_q
+
+    regime_fractions = {
+        "Global Averaging": frac_global,
+        "Cluster Averaging": frac_cluster,
+        "Single Memory": frac_single,
+    }
+    dominant_regime = max(regime_fractions, key=lambda k: regime_fractions[k])
+
+    numeric_metric_tensors: dict[str, torch.Tensor] = {
+        "target_cluster_mass": metrics["target_cluster_mass"],
+        "wrong_cluster_mass": metrics["wrong_cluster_mass"],
+        "max_cluster_mass": metrics["max_cluster_mass"],
+        "top1_mass": metrics["top1_mass"],
+        "entropy": metrics["entropy"],
+        "cluster_entropy": metrics["cluster_entropy"],
+        "distance_to_cluster": metrics["distance_to_cluster"],
+        "distance_to_nearest_memory": metrics["distance_to_nearest_memory"],
+        "top1_in_target_cluster": metrics["top1_in_target_cluster"],
+        "effective_memory_count": metrics["effective_memory_count"],
+        "effective_cluster_count": metrics["effective_cluster_count"],
+        "dynamics_residual": dynamics["dynamics_residual"],
+        "perturbation_return_dist": dynamics["perturbation_return_dist"],
+        "perturbation_contraction_ratio": dynamics["perturbation_contraction_ratio"],
     }
 
+    result: dict[str, Any] = {
+        "beta": beta,
+        "query_count": num_q,
+        "seed_count": 1,
+        "regime": dominant_regime,
+        "regime_fractions": regime_fractions,
+        "fraction_global_averaging": frac_global,
+        "fraction_cluster_averaging": frac_cluster,
+        "fraction_single_memory": frac_single,
+        "correct_cluster_fraction": metrics["correct_cluster"].mean().item(),
+        "wrong_cluster_fraction": metrics["wrong_cluster"].mean().item(),
+        "wrong_cluster_concentration_fraction": metrics["wrong_cluster_concentration"].mean().item(),
+        "correct_cluster_concentration_fraction": metrics["correct_cluster_concentration"].mean().item(),
+        "correct_single_memory_fraction": metrics["correct_single_memory"].mean().item(),
+        "wrong_single_memory_fraction": metrics["wrong_single_memory"].mean().item(),
+    }
 
-def classify_retrieval_regime(
-    target_cluster_mass: float,
-    top1_mass: float,
-    num_clusters: int,
-    memories_per_cluster: int,
-) -> str:
-    """Classify the qualitative retrieval regime based on mass distribution."""
-    cluster_metastable_threshold = 0.85
-    single_memory_threshold = 0.70
+    for key, tensor in numeric_metric_tensors.items():
+        mean_val = tensor.mean().item()
+        q_std = tensor.std().item() if num_q > 1 else 0.0
+        result[key] = mean_val
+        result[f"{key}_query_std"] = q_std
+        result[f"{key}_seed_std"] = 0.0
+        result[f"{key}_std"] = q_std  # backwards-compatible alias
 
-    if target_cluster_mass < cluster_metastable_threshold:
-        return "Global Averaging"
-    elif top1_mass >= single_memory_threshold:
-        return "Single Memory"
-    else:
-        return "Cluster / Metastable"
+    return result
 
 
 def run_single_seed_experiment(
@@ -491,12 +653,8 @@ def run_single_seed_experiment(
             beta=beta,
             num_updates=cfg["num_updates"],
             normalize=cfg["normalize"],
-        )
-        row["regime"] = classify_retrieval_regime(
-            target_cluster_mass=row["target_cluster_mass"],
-            top1_mass=row["top1_mass"],
-            num_clusters=cfg["num_clusters"],
-            memories_per_cluster=cfg["memories_per_cluster"],
+            compute_dynamics=True,
+            generator=generator,
         )
         results.append(row)
 
@@ -551,6 +709,8 @@ def run_benchmark(
         num_betas = len(cfg["beta_values"])
         metric_keys = [
             "target_cluster_mass",
+            "wrong_cluster_mass",
+            "max_cluster_mass",
             "top1_mass",
             "entropy",
             "cluster_entropy",
@@ -559,25 +719,49 @@ def run_benchmark(
             "top1_in_target_cluster",
             "effective_memory_count",
             "effective_cluster_count",
+            "dynamics_residual",
+            "perturbation_return_dist",
+            "perturbation_contraction_ratio",
+            "correct_cluster_fraction",
+            "wrong_cluster_fraction",
+            "wrong_cluster_concentration_fraction",
+            "correct_cluster_concentration_fraction",
+            "correct_single_memory_fraction",
+            "wrong_single_memory_fraction",
+            "fraction_global_averaging",
+            "fraction_cluster_averaging",
+            "fraction_single_memory",
         ]
 
         for b_idx in range(num_betas):
             beta = cfg["beta_values"][b_idx]
-            agg_row: dict[str, Any] = {"beta": beta}
+            agg_row: dict[str, Any] = {
+                "beta": beta,
+                "seed_count": len(seeds),
+                "query_count": cfg["num_queries"],
+            }
             for k in metric_keys:
-                vals = [seed_res[b_idx][k] for seed_res in all_seed_results]
-                mean_val = float(sum(vals) / len(vals))
-                variance = float(sum((v - mean_val) ** 2 for v in vals) / len(vals))
-                std_val = float(variance ** 0.5)
-                agg_row[k] = mean_val
-                agg_row[f"{k}_std"] = std_val
+                seed_vals = [seed_res[b_idx][k] for seed_res in all_seed_results]
+                mean_val = float(sum(seed_vals) / len(seed_vals))
+                variance = float(sum((v - mean_val) ** 2 for v in seed_vals) / (len(seed_vals) - 1)) if len(seed_vals) > 1 else 0.0
+                seed_std = float(variance ** 0.5)
 
-            agg_row["regime"] = classify_retrieval_regime(
-                target_cluster_mass=agg_row["target_cluster_mass"],
-                top1_mass=agg_row["top1_mass"],
-                num_clusters=cfg["num_clusters"],
-                memories_per_cluster=cfg["memories_per_cluster"],
-            )
+                query_stds = [seed_res[b_idx].get(f"{k}_query_std", 0.0) for seed_res in all_seed_results]
+                mean_query_std = float(sum(query_stds) / len(query_stds))
+
+                agg_row[k] = mean_val
+                agg_row[f"{k}_seed_std"] = seed_std
+                agg_row[f"{k}_query_std"] = mean_query_std
+                agg_row[f"{k}_std"] = seed_std  # backwards-compatible alias
+
+            # Determine dominant regime across seeds
+            regime_fractions = {
+                "Global Averaging": agg_row["fraction_global_averaging"],
+                "Cluster Averaging": agg_row["fraction_cluster_averaging"],
+                "Single Memory": agg_row["fraction_single_memory"],
+            }
+            agg_row["regime_fractions"] = regime_fractions
+            agg_row["regime"] = max(regime_fractions, key=lambda k: regime_fractions[k])
             final_results.append(agg_row)
 
         final_metadata = {
@@ -587,7 +771,12 @@ def run_benchmark(
         }
 
     if output_dir is not None:
-        save_reports(final_results, output_dir, metadata=final_metadata)
+        save_reports(
+            final_results,
+            output_dir,
+            metadata=final_metadata,
+            per_seed_results=all_seed_results if len(seeds) > 1 else None,
+        )
         if save_plot and cfg.get("save_plot", True):
             plot_path = output_dir / "cluster_retrieval.png"
             plot_cluster_benchmark(final_results, plot_path, cfg=cfg)
@@ -657,46 +846,69 @@ def print_cluster_results_table(
         print(f"Theoretical limits: Uniform mass across clusters = {1.0 / num_clusters:.4f}, Uniform mass across all memories = {1.0 / tot_mem:.4f}.")
     print("\nQualitative Transition Regimes:")
     print("  1. LOW beta:      Global Averaging (attention spread broadly across clusters, high entropy).")
-    print("  2. MEDIUM beta:   Cluster / Metastable Retrieval (target cluster mass ~1.0, low cluster dist, distributed within cluster).")
-    print("  3. HIGH beta:     Single-Memory Retrieval (top-1 mass dominates, distance to nearest memory -> 0).\n")
+    print("  2. MEDIUM beta:   Cluster Averaging (attention focused within target cluster; candidate metastable state).")
+    print("  3. HIGH beta:     Single-Memory Concentration (top-1 mass dominates, distance to nearest memory -> 0).\n")
 
 
 def save_reports(
     results: list[dict[str, Any]],
     output_dir: Path,
     metadata: dict[str, Any] | None = None,
+    per_seed_results: list[list[dict[str, Any]]] | None = None,
 ) -> None:
     """Save cluster benchmark results and metadata to JSON and CSV files."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    json_payload = {
+    json_payload: dict[str, Any] = {
         "metadata": metadata or {},
         "results": results,
     }
+    if per_seed_results is not None:
+        json_payload["per_seed_results"] = per_seed_results
+
     json_path = output_dir / "results.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_payload, f, indent=2)
 
     csv_path = output_dir / "results.csv"
     if results:
-        fieldnames = [
-            "beta",
-            "target_cluster_mass",
-            "top1_mass",
-            "entropy",
-            "cluster_entropy",
-            "distance_to_cluster",
-            "distance_to_nearest_memory",
-            "top1_in_target_cluster",
-            "effective_memory_count",
-            "effective_cluster_count",
-            "regime",
-        ]
+        fieldnames: list[str] = []
+        for r in results:
+            for k, v in r.items():
+                if not isinstance(v, (dict, list)) and k not in fieldnames:
+                    fieldnames.append(k)
+
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for r in results:
-                writer.writerow(r)
+                scalar_row = {
+                    k: v for k, v in r.items() if not isinstance(v, (dict, list))
+                }
+                writer.writerow(scalar_row)
+
+    if per_seed_results and len(per_seed_results) > 1:
+        per_seed_csv = output_dir / "per_seed_results.csv"
+        seeds = (metadata or {}).get("seeds", list(range(len(per_seed_results))))
+        flat_rows: list[dict[str, Any]] = []
+        for s_idx, s_results in enumerate(per_seed_results):
+            s_val = seeds[s_idx] if s_idx < len(seeds) else s_idx
+            for r in s_results:
+                flat_rows.append({
+                    "seed": s_val,
+                    **{k: v for k, v in r.items() if not isinstance(v, (dict, list))},
+                })
+        if flat_rows:
+            flat_fields: list[str] = []
+            for fr in flat_rows:
+                for k in fr:
+                    if k not in flat_fields:
+                        flat_fields.append(k)
+            with open(per_seed_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=flat_fields, extrasaction="ignore")
+                writer.writeheader()
+                for fr in flat_rows:
+                    writer.writerow(fr)
 
 
 def plot_cluster_benchmark(
@@ -704,13 +916,7 @@ def plot_cluster_benchmark(
     output_path: Path,
     cfg: dict[str, Any] | None = None,
 ) -> bool:
-    """Generate a 4-panel scientific diagnostic plot of the cluster retrieval transition.
-
-    Panel 1: Target Cluster Mass vs beta (Regimes: Global average -> Cluster concentration)
-    Panel 2: Top-1 Memory Mass vs beta (Regimes: Distributed -> Single-memory collapse)
-    Panel 3: Entropy vs beta (Memory-level entropy vs Cluster-level entropy)
-    Panel 4: Retrieval Distances vs beta (Cluster center distance vs Nearest memory distance)
-    """
+    """Generate a 4-panel scientific diagnostic plot of the cluster retrieval transition."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -731,13 +937,22 @@ def plot_cluster_benchmark(
     dist_clusters = [r["distance_to_cluster"] for r in results]
     dist_memories = [r["distance_to_nearest_memory"] for r in results]
 
+    has_seeds = any(r.get("seed_count", 1) > 1 for r in results)
+    std_key = "_seed_std" if has_seeds else "_query_std"
+    has_variance = any(r.get(f"target_cluster_mass{std_key}", 0.0) > 1e-6 for r in results)
+    uncertainty_desc = (
+        f"Mean \u00b1 1 std ({'seeds' if has_seeds else 'queries'})"
+        if has_variance
+        else "Mean-only trajectories"
+    )
+
     num_clusters = cfg.get("num_clusters", 4) if cfg else 4
     mem_per_cluster = cfg.get("memories_per_cluster", 10) if cfg else 10
     total_memories = num_clusters * mem_per_cluster
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(
-        r"Hopfield Memory: Cluster / Metastable Retrieval Benchmark ($\beta$ Transition)",
+        f"Hopfield Memory: Cluster Retrieval Transition across \u03b2 ({uncertainty_desc})",
         fontsize=14,
         fontweight="bold",
     )
@@ -745,6 +960,16 @@ def plot_cluster_benchmark(
     # Panel 1: Target Cluster Mass
     ax = axes[0, 0]
     ax.plot(betas, cluster_masses, marker="o", color="#1f77b4", linewidth=2.2, label="Target Cluster Mass")
+    if has_variance:
+        stds = [r.get(f"target_cluster_mass{std_key}", 0.0) for r in results]
+        ax.fill_between(
+            betas,
+            [m - s for m, s in zip(cluster_masses, stds)],
+            [m + s for m, s in zip(cluster_masses, stds)],
+            color="#1f77b4",
+            alpha=0.2,
+            label=f"\u00b11 std ({'seed' if has_seeds else 'query'})",
+        )
     ax.axhline(
         1.0 / num_clusters,
         color="#7f7f7f",
@@ -763,6 +988,15 @@ def plot_cluster_benchmark(
     # Panel 2: Top-1 Memory Mass
     ax = axes[0, 1]
     ax.plot(betas, top1_masses, marker="s", color="#d62728", linewidth=2.2, label=r"Top-1 Mass ($\max_i p_i$)")
+    if has_variance:
+        stds = [r.get(f"top1_mass{std_key}", 0.0) for r in results]
+        ax.fill_between(
+            betas,
+            [m - s for m, s in zip(top1_masses, stds)],
+            [m + s for m, s in zip(top1_masses, stds)],
+            color="#d62728",
+            alpha=0.2,
+        )
     ax.axhline(
         1.0 / total_memories,
         color="#7f7f7f",
@@ -785,10 +1019,15 @@ def plot_cluster_benchmark(
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.6)
 
-    # Panel 3: Entropy (Memory-Level vs Cluster-Level)
+    # Panel 3: Entropy
     ax = axes[1, 0]
     ax.plot(betas, mem_entropies, marker="^", color="#ff7f0e", linewidth=2.2, label="Memory Entropy (all memories)")
     ax.plot(betas, clus_entropies, marker="v", color="#9467bd", linewidth=2.2, linestyle="--", label="Cluster Entropy (inter-cluster)")
+    if has_variance:
+        m_stds = [r.get(f"entropy{std_key}", 0.0) for r in results]
+        ax.fill_between(betas, [m - s for m, s in zip(mem_entropies, m_stds)], [m + s for m, s in zip(mem_entropies, m_stds)], color="#ff7f0e", alpha=0.15)
+        c_stds = [r.get(f"cluster_entropy{std_key}", 0.0) for r in results]
+        ax.fill_between(betas, [m - s for m, s in zip(clus_entropies, c_stds)], [m + s for m, s in zip(clus_entropies, c_stds)], color="#9467bd", alpha=0.15)
     ax.set_xscale("log")
     ax.set_xlabel(r"Inverse Temperature $\beta$ (log scale)")
     ax.set_ylabel("Shannon Entropy")
@@ -796,7 +1035,7 @@ def plot_cluster_benchmark(
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.6)
 
-    # Panel 4: Distances (Target Cluster Center vs Nearest Stored Memory)
+    # Panel 4: Distances (Generating Prototype vs Nearest Stored Memory)
     ax = axes[1, 1]
     ax.plot(
         betas,
@@ -804,7 +1043,7 @@ def plot_cluster_benchmark(
         marker="o",
         color="#17becf",
         linewidth=2.2,
-        label="Distance to Cluster Mean (Prototype)",
+        label="Distance to Generating Prototype",
     )
     ax.plot(
         betas,
@@ -814,10 +1053,15 @@ def plot_cluster_benchmark(
         linewidth=2.2,
         label="Distance to Nearest Memory",
     )
+    if has_variance:
+        dc_stds = [r.get(f"distance_to_cluster{std_key}", 0.0) for r in results]
+        ax.fill_between(betas, [m - s for m, s in zip(dist_clusters, dc_stds)], [m + s for m, s in zip(dist_clusters, dc_stds)], color="#17becf", alpha=0.15)
+        dm_stds = [r.get(f"distance_to_nearest_memory{std_key}", 0.0) for r in results]
+        ax.fill_between(betas, [m - s for m, s in zip(dist_memories, dm_stds)], [m + s for m, s in zip(dist_memories, dm_stds)], color="#8c564b", alpha=0.15)
     ax.set_xscale("log")
     ax.set_xlabel(r"Inverse Temperature $\beta$ (log scale)")
     ax.set_ylabel("Euclidean Distance (L2)")
-    ax.set_title(r"State Convergence: Cluster Prototype $\to$ Individual Attractor")
+    ax.set_title(r"State Convergence: Generating Prototype $\to$ Memory Attractor")
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.6)
 
@@ -830,7 +1074,7 @@ def plot_cluster_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Hopfield cluster / metastable retrieval benchmark."
+        description="Run Hopfield cluster retrieval benchmark."
     )
     parser.add_argument(
         "--config",
@@ -919,24 +1163,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Load base configuration
-    config: dict[str, Any]
-    if args.config.exists():
-        with open(args.config, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-    else:
-        config = {
-            "seed": 42,
-            "dim": 64,
-            "num_clusters": 4,
-            "memories_per_cluster": 10,
-            "cluster_separation": 3.0,
-            "cluster_noise": 0.15,
-            "query_noise": 0.10,
-            "num_queries": 50,
-            "target_cluster": 0,
-            "beta_values": DEFAULT_BETAS,
-        }
+    # Fail explicitly if specified config file does not exist
+    if not args.config.exists():
+        raise FileNotFoundError(f"Configuration file not found: {args.config}")
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        raw_config = yaml.safe_load(f)
+
+    if not isinstance(raw_config, dict):
+        raise TypeError(
+            f"YAML configuration at {args.config} must be a mapping, got {type(raw_config).__name__}."
+        )
+    config: dict[str, Any] = raw_config
 
     # Apply CLI overrides
     if args.seed is not None:

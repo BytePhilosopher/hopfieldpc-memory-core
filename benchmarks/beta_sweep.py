@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import warnings
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,24 @@ from hopfieldpc.diagnostics import (
 from hopfieldpc.functional import multi_step_retrieve
 
 DEFAULT_BETAS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+
+def validate_beta_values(beta_values: Any) -> list[float]:
+    """Validate and normalize a list of positive finite beta values."""
+    if not isinstance(beta_values, list) or len(beta_values) == 0:
+        raise ValueError("beta_values must be a non-empty list of positive floats.")
+
+    resolved_betas: list[float] = []
+    for b in beta_values:
+        if (
+            isinstance(b, bool)
+            or not isinstance(b, (int, float))
+            or not math.isfinite(b)
+            or b <= 0
+        ):
+            raise ValueError(f"All beta_values must be positive numbers, got {b!r}.")
+        resolved_betas.append(float(b))
+    return resolved_betas
 
 
 def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -129,14 +148,7 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     noise_level = float(raw_noise)
 
     beta_values = config.get("beta_values", DEFAULT_BETAS)
-    if not isinstance(beta_values, list) or len(beta_values) == 0:
-        raise ValueError("beta_values must be a non-empty list of positive floats.")
-
-    resolved_betas: list[float] = []
-    for b in beta_values:
-        if isinstance(b, bool) or not isinstance(b, (int, float)) or b <= 0:
-            raise ValueError(f"All beta_values must be positive numbers, got {b!r}.")
-        resolved_betas.append(float(b))
+    resolved_betas = validate_beta_values(beta_values)
 
     normalize = bool(config.get("normalize", False))
 
