@@ -15,7 +15,7 @@ from .diagnostics import (
     topk_mass,
     topk_recall,
 )
-from .energy import hopfield_energy
+from .energy import hopfield_energy, hopfield_full_energy
 from .functional import hopfield_retrieve, multi_step_retrieve
 from .memory import HopfieldMemory
 
@@ -28,6 +28,7 @@ __all__ = [
     "attention_entropy",
     "build_retrieval_diagnostics",
     "hopfield_energy",
+    "hopfield_full_energy",
     "hopfield_retrieve",
     "max_attention_weight",
     "multi_step_retrieve",
