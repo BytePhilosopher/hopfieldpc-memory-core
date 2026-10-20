@@ -1,4 +1,9 @@
-"""Cluster retrieval benchmark for modern Hopfield memory."""
+"""Cluster retrieval benchmark for modern Hopfield memory.
+
+Run from the repository root as a module:
+
+    python -m benchmarks.cluster_retrieval --config configs/cluster_retrieval.yaml
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,6 @@ import argparse
 import csv
 import json
 import math
-import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -14,12 +18,8 @@ from typing import Any
 import torch
 import yaml
 
-# Ensure project root is in sys.path when script is executed directly
-repo_root = Path(__file__).resolve().parent.parent
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-from benchmarks.beta_sweep import validate_beta_values
+from benchmarks.validation import validate_beta_values
+from hopfieldpc.api import validate_beta
 from hopfieldpc.diagnostics import (
     argmax_memory_index,
     attention_entropy,
@@ -29,6 +29,26 @@ from hopfieldpc.diagnostics import (
 from hopfieldpc.functional import hopfield_retrieve, multi_step_retrieve
 
 DEFAULT_BETAS = [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+
+# Regime classification thresholds (see classify_retrieval_regime).
+SINGLE_MEMORY_THRESHOLD = 0.70
+CLUSTER_THRESHOLD = 0.85
+GLOBAL_UNIFORMITY_THRESHOLD = 0.90
+
+REGIME_LABELS = ("Global Averaging", "Broad/Mixed", "Cluster Averaging", "Single Memory")
+REGIME_FRACTION_KEYS = {
+    "Global Averaging": "fraction_global_averaging",
+    "Broad/Mixed": "fraction_broad_mixed",
+    "Cluster Averaging": "fraction_cluster_averaging",
+    "Single Memory": "fraction_single_memory",
+}
+
+DYNAMICS_METRICS = (
+    "dynamics_residual",
+    "trajectory_separation_initial",
+    "trajectory_separation_final",
+    "trajectory_separation_ratio",
+)
 
 
 def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -145,7 +165,6 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
             f"target_cluster must be an integer in [0, {num_clusters - 1}], got {target_cluster!r}."
         )
 
-    # Reuse shared beta validator from Task 12
     beta_values = config.get("beta_values", DEFAULT_BETAS)
     resolved_betas = validate_beta_values(beta_values)
 
@@ -176,6 +195,38 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError(f"num_updates must be a positive integer, got {num_updates!r}.")
 
+    if "compute_dynamics" in config:
+        if not isinstance(config["compute_dynamics"], bool):
+            raise ValueError(
+                "compute_dynamics must be a genuine boolean (True/False), "
+                f"got {config['compute_dynamics']!r}."
+            )
+        compute_dynamics = config["compute_dynamics"]
+    else:
+        compute_dynamics = True
+
+    perturbation_noise = config.get("perturbation_noise", 0.05)
+    if (
+        isinstance(perturbation_noise, bool)
+        or not isinstance(perturbation_noise, (int, float))
+        or not math.isfinite(perturbation_noise)
+        or perturbation_noise <= 0
+    ):
+        raise ValueError(
+            f"perturbation_noise must be a positive finite number, got {perturbation_noise!r}."
+        )
+    perturbation_noise = float(perturbation_noise)
+
+    perturbation_steps = config.get("perturbation_steps", 3)
+    if (
+        isinstance(perturbation_steps, bool)
+        or not isinstance(perturbation_steps, int)
+        or perturbation_steps <= 0
+    ):
+        raise ValueError(
+            f"perturbation_steps must be a positive integer, got {perturbation_steps!r}."
+        )
+
     reports_dir = config.get("reports_dir", "reports/cluster_retrieval")
 
     return {
@@ -192,6 +243,9 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
         "beta_values": resolved_betas,
         "normalize": normalize,
         "num_updates": num_updates,
+        "compute_dynamics": compute_dynamics,
+        "perturbation_noise": perturbation_noise,
+        "perturbation_steps": perturbation_steps,
         "reports_dir": reports_dir,
         "save_plot": save_plot,
     }
@@ -344,16 +398,50 @@ def compute_cluster_masses(
     return cluster_masses
 
 
+def sample_perturbations(
+    shape: torch.Size | tuple[int, ...],
+    perturbation_noise: float,
+    generator: torch.Generator | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Draw isotropic Gaussian state perturbations delta ~ N(0, perturbation_noise^2 * I).
+
+    Sample once per seed and reuse across beta values so that dynamics
+    diagnostics at different beta are paired on identical perturbations.
+    """
+    return torch.randn(shape, generator=generator, dtype=dtype) * perturbation_noise
+
+
 def compute_dynamics_diagnostics(
     retrieved: torch.Tensor,
     memory: torch.Tensor,
     beta: float,
+    perturbation: torch.Tensor,
     normalize: bool = False,
-    perturbation_noise: float = 0.05,
     perturbation_steps: int = 3,
-    generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute iterative dynamics diagnostics for candidate retrieved states."""
+    """Compute iterative dynamics diagnostics for retrieved states q_T.
+
+    Quantities (per query, with R the one-step Hopfield update and k = perturbation_steps):
+        dynamics_residual             = ||R(q_T) - q_T||
+        trajectory_separation_initial = ||delta||
+        trajectory_separation_final   = ||R^k(q_T + delta) - R^k(q_T)||
+        trajectory_separation_ratio   = final / initial
+
+    The separation ratio compares the perturbed trajectory against the
+    unperturbed trajectory started from the same q_T, so it does not mix in
+    ordinary drift when q_T is not stationary (e.g. after a single update).
+    A ratio below 1 is empirical evidence that the tested perturbations shrink
+    under the dynamics; it is not a proof of basin stability. Interpret it as
+    return toward a fixed state only where dynamics_residual is also small.
+    """
+    if perturbation.shape != retrieved.shape:
+        raise ValueError(
+            f"perturbation shape {tuple(perturbation.shape)} must match "
+            f"retrieved shape {tuple(retrieved.shape)}."
+        )
+    perturbation = perturbation.to(dtype=retrieved.dtype, device=retrieved.device)
+
     next_step, _ = hopfield_retrieve(
         query=retrieved,
         memory=memory,
@@ -362,56 +450,61 @@ def compute_dynamics_diagnostics(
     )
     residual = retrieval_distance(next_step, retrieved, p=2.0)
 
-    delta = torch.randn(
-        retrieved.shape,
-        generator=generator,
-        dtype=retrieved.dtype,
-        device=retrieved.device,
-    ) * perturbation_noise
-    perturbed_q = retrieved + delta
-    init_dist = retrieval_distance(perturbed_q, retrieved, p=2.0).clamp_min(1e-8)
-
-    relaxed_state, _ = multi_step_retrieve(
-        query=perturbed_q,
+    unperturbed_state, _ = multi_step_retrieve(
+        query=retrieved,
         memory=memory,
         beta=beta,
         num_updates=perturbation_steps,
         normalize=normalize,
     )
-    return_dist = retrieval_distance(relaxed_state, retrieved, p=2.0)
-    contraction_ratio = return_dist / init_dist
+    perturbed_state, _ = multi_step_retrieve(
+        query=retrieved + perturbation,
+        memory=memory,
+        beta=beta,
+        num_updates=perturbation_steps,
+        normalize=normalize,
+    )
+    initial_sep = torch.linalg.vector_norm(perturbation, dim=-1)
+    final_sep = retrieval_distance(perturbed_state, unperturbed_state, p=2.0)
+    separation_ratio = final_sep / initial_sep.clamp_min(1e-12)
 
     return {
         "dynamics_residual": residual,
-        "perturbation_return_dist": return_dist,
-        "perturbation_init_dist": init_dist,
-        "perturbation_contraction_ratio": contraction_ratio,
+        "trajectory_separation_initial": initial_sep,
+        "trajectory_separation_final": final_sep,
+        "trajectory_separation_ratio": separation_ratio,
     }
 
 
 def classify_retrieval_regime(
-    max_cluster_mass: float | None = None,
-    top1_mass: float | None = None,
+    max_cluster_mass: float,
+    top1_mass: float,
+    normalized_entropy: float,
     *,
-    single_memory_threshold: float = 0.70,
-    cluster_threshold: float = 0.85,
-    target_cluster_mass: float | None = None,
-    num_clusters: int | None = None,
-    memories_per_cluster: int | None = None,
+    single_memory_threshold: float = SINGLE_MEMORY_THRESHOLD,
+    cluster_threshold: float = CLUSTER_THRESHOLD,
+    global_uniformity_threshold: float = GLOBAL_UNIFORMITY_THRESHOLD,
 ) -> str:
-    """Classify the concentration regime of a retrieval distribution independently of target correctness."""
-    c_mass = max_cluster_mass if max_cluster_mass is not None else target_cluster_mass
-    if c_mass is None:
-        raise ValueError("Must provide max_cluster_mass (or target_cluster_mass).")
-    if top1_mass is None:
-        raise ValueError("Must provide top1_mass.")
+    """Classify the concentration regime of one retrieval distribution.
 
+    Classification depends only on the attention distribution, never on the
+    target cluster, so concentration on a wrong cluster is still labeled as
+    concentration. Rules are applied in order:
+
+        1. Single Memory:     top1_mass >= single_memory_threshold
+        2. Cluster Averaging: max_cluster_mass >= cluster_threshold
+        3. Global Averaging:  normalized_entropy >= global_uniformity_threshold,
+                              i.e. H(p) / log(num_memories) is near 1 (near-uniform)
+        4. Broad/Mixed:       everything else (concentrated, but on no single
+                              memory or cluster, e.g. split across two clusters)
+    """
     if top1_mass >= single_memory_threshold:
         return "Single Memory"
-    elif c_mass >= cluster_threshold:
+    if max_cluster_mass >= cluster_threshold:
         return "Cluster Averaging"
-    else:
+    if normalized_entropy >= global_uniformity_threshold:
         return "Global Averaging"
+    return "Broad/Mixed"
 
 
 def compute_cluster_metrics(
@@ -449,14 +542,16 @@ def compute_cluster_metrics(
     correct_cluster = (argmax_cluster == target_clusters).float()
     wrong_cluster = (argmax_cluster != target_clusters).float()
 
+    cluster_concentrated = max_cluster_mass >= CLUSTER_THRESHOLD
+    single_concentrated = top1 >= SINGLE_MEMORY_THRESHOLD
     wrong_cluster_concentration = (
-        (max_cluster_mass >= 0.85) & (argmax_cluster != target_clusters)
+        cluster_concentrated & (argmax_cluster != target_clusters)
     ).float()
     correct_cluster_concentration = (
-        (max_cluster_mass >= 0.85) & (argmax_cluster == target_clusters)
+        cluster_concentrated & (argmax_cluster == target_clusters)
     ).float()
-    wrong_single_memory = ((top1 >= 0.70) & (top1_clusters != target_clusters)).float()
-    correct_single_memory = ((top1 >= 0.70) & (top1_clusters == target_clusters)).float()
+    wrong_single_memory = (single_concentrated & (top1_clusters != target_clusters)).float()
+    correct_single_memory = (single_concentrated & (top1_clusters == target_clusters)).float()
 
     weights_sq_sum = (weights ** 2).sum(dim=-1).clamp_min(1e-12)
     effective_memories = 1.0 / weights_sq_sum
@@ -464,13 +559,29 @@ def compute_cluster_metrics(
     cluster_masses_sq_sum = (cluster_masses ** 2).sum(dim=-1).clamp_min(1e-12)
     effective_clusters = 1.0 / cluster_masses_sq_sum
 
+    num_memories = weights.shape[-1]
+    normalized_entropy = (
+        mem_entropy / math.log(num_memories)
+        if num_memories > 1
+        else torch.ones_like(mem_entropy)
+    )
+
     query_regimes: list[str] = []
     for i in range(retrieved.shape[0]):
         r = classify_retrieval_regime(
             max_cluster_mass=max_cluster_mass[i].item(),
             top1_mass=top1[i].item(),
+            normalized_entropy=normalized_entropy[i].item(),
         )
         query_regimes.append(r)
+    regime_indicators = {
+        label: torch.tensor(
+            [float(r == label) for r in query_regimes],
+            dtype=weights.dtype,
+            device=weights.device,
+        )
+        for label in REGIME_LABELS
+    }
 
     return {
         "target_cluster_mass": target_cluster_mass,
@@ -479,6 +590,7 @@ def compute_cluster_metrics(
         "max_cluster_mass": max_cluster_mass,
         "top1_mass": top1,
         "entropy": mem_entropy,
+        "normalized_entropy": normalized_entropy,
         "cluster_entropy": clus_entropy,
         "distance_to_cluster": dist_cluster,
         "distance_to_nearest_memory": dist_nearest_memory,
@@ -492,7 +604,13 @@ def compute_cluster_metrics(
         "effective_memory_count": effective_memories,
         "effective_cluster_count": effective_clusters,
         "query_regimes": query_regimes,
+        "regime_indicators": regime_indicators,
     }
+
+
+def _query_std(values: torch.Tensor) -> float | None:
+    """Sample standard deviation over queries; undefined (None) for a single query."""
+    return values.std().item() if values.numel() > 1 else None
 
 
 def evaluate_cluster_retrieval(
@@ -506,11 +624,26 @@ def evaluate_cluster_retrieval(
     num_updates: int = 1,
     normalize: bool = False,
     compute_dynamics: bool = True,
+    perturbation: torch.Tensor | None = None,
+    perturbation_noise: float = 0.05,
+    perturbation_steps: int = 3,
     generator: torch.Generator | None = None,
 ) -> dict[str, Any]:
-    """Execute Hopfield retrieval with specified beta and calculate aggregated cluster metrics."""
-    if beta <= 0:
-        raise ValueError(f"beta must be positive, got {beta!r}.")
+    """Execute Hopfield retrieval at one beta and summarize per-query cluster metrics.
+
+    Uncertainty semantics (single seed):
+        k             mean over queries
+        k_query_std   sample standard deviation over queries (None for one query)
+
+    Fraction metrics are means of per-query 0/1 indicators, and their query
+    std is computed from those same indicators.
+
+    Dynamics diagnostics use ``perturbation`` when given; pass the same tensor
+    for every beta to keep comparisons paired. Otherwise one is sampled with
+    ``perturbation_noise`` from ``generator``. With ``compute_dynamics=False``
+    the dynamics fields are None and ``dynamics_evaluated`` is False.
+    """
+    beta = validate_beta(beta)
 
     retrieved, weights = multi_step_retrieve(
         query=queries,
@@ -542,78 +675,70 @@ def evaluate_cluster_retrieval(
     if not torch.allclose(cluster_masses_sum, torch.ones_like(cluster_masses_sum), atol=1e-4):
         raise ValueError(f"Cluster masses do not sum to 1 for beta={beta}.")
 
-    num_q = queries.shape[0]
-
-    # Iterative dynamics checks
-    if compute_dynamics:
-        dynamics = compute_dynamics_diagnostics(
-            retrieved=retrieved,
-            memory=memory,
-            beta=beta,
-            normalize=normalize,
-            generator=generator,
-        )
-    else:
-        dynamics = {
-            "dynamics_residual": torch.zeros(num_q, device=retrieved.device),
-            "perturbation_return_dist": torch.zeros(num_q, device=retrieved.device),
-            "perturbation_contraction_ratio": torch.zeros(num_q, device=retrieved.device),
-        }
-
-    # Aggregate regime fractions from per-query classifications
-    regimes = metrics["query_regimes"]
-    frac_global = sum(1 for r in regimes if r == "Global Averaging") / num_q
-    frac_cluster = sum(1 for r in regimes if r == "Cluster Averaging") / num_q
-    frac_single = sum(1 for r in regimes if r == "Single Memory") / num_q
-
+    regime_indicators: dict[str, torch.Tensor] = metrics["regime_indicators"]
     regime_fractions = {
-        "Global Averaging": frac_global,
-        "Cluster Averaging": frac_cluster,
-        "Single Memory": frac_single,
+        label: regime_indicators[label].mean().item() for label in REGIME_LABELS
     }
     dominant_regime = max(regime_fractions, key=lambda k: regime_fractions[k])
 
-    numeric_metric_tensors: dict[str, torch.Tensor] = {
+    per_query: dict[str, torch.Tensor] = {
         "target_cluster_mass": metrics["target_cluster_mass"],
         "wrong_cluster_mass": metrics["wrong_cluster_mass"],
         "max_cluster_mass": metrics["max_cluster_mass"],
         "top1_mass": metrics["top1_mass"],
         "entropy": metrics["entropy"],
+        "normalized_entropy": metrics["normalized_entropy"],
         "cluster_entropy": metrics["cluster_entropy"],
         "distance_to_cluster": metrics["distance_to_cluster"],
         "distance_to_nearest_memory": metrics["distance_to_nearest_memory"],
         "top1_in_target_cluster": metrics["top1_in_target_cluster"],
         "effective_memory_count": metrics["effective_memory_count"],
         "effective_cluster_count": metrics["effective_cluster_count"],
-        "dynamics_residual": dynamics["dynamics_residual"],
-        "perturbation_return_dist": dynamics["perturbation_return_dist"],
-        "perturbation_contraction_ratio": dynamics["perturbation_contraction_ratio"],
+        "correct_cluster_fraction": metrics["correct_cluster"],
+        "wrong_cluster_fraction": metrics["wrong_cluster"],
+        "wrong_cluster_concentration_fraction": metrics["wrong_cluster_concentration"],
+        "correct_cluster_concentration_fraction": metrics["correct_cluster_concentration"],
+        "correct_single_memory_fraction": metrics["correct_single_memory"],
+        "wrong_single_memory_fraction": metrics["wrong_single_memory"],
     }
+    for label in REGIME_LABELS:
+        per_query[REGIME_FRACTION_KEYS[label]] = regime_indicators[label]
+
+    if compute_dynamics:
+        if perturbation is None:
+            perturbation = sample_perturbations(
+                retrieved.shape,
+                perturbation_noise,
+                generator=generator,
+                dtype=retrieved.dtype,
+            )
+        per_query.update(
+            compute_dynamics_diagnostics(
+                retrieved=retrieved,
+                memory=memory,
+                beta=beta,
+                perturbation=perturbation,
+                normalize=normalize,
+                perturbation_steps=perturbation_steps,
+            )
+        )
 
     result: dict[str, Any] = {
         "beta": beta,
-        "query_count": num_q,
+        "query_count": queries.shape[0],
         "seed_count": 1,
         "regime": dominant_regime,
         "regime_fractions": regime_fractions,
-        "fraction_global_averaging": frac_global,
-        "fraction_cluster_averaging": frac_cluster,
-        "fraction_single_memory": frac_single,
-        "correct_cluster_fraction": metrics["correct_cluster"].mean().item(),
-        "wrong_cluster_fraction": metrics["wrong_cluster"].mean().item(),
-        "wrong_cluster_concentration_fraction": metrics["wrong_cluster_concentration"].mean().item(),
-        "correct_cluster_concentration_fraction": metrics["correct_cluster_concentration"].mean().item(),
-        "correct_single_memory_fraction": metrics["correct_single_memory"].mean().item(),
-        "wrong_single_memory_fraction": metrics["wrong_single_memory"].mean().item(),
+        "dynamics_evaluated": compute_dynamics,
     }
+    for key, tensor in per_query.items():
+        result[key] = tensor.mean().item()
+        result[f"{key}_query_std"] = _query_std(tensor)
 
-    for key, tensor in numeric_metric_tensors.items():
-        mean_val = tensor.mean().item()
-        q_std = tensor.std().item() if num_q > 1 else 0.0
-        result[key] = mean_val
-        result[f"{key}_query_std"] = q_std
-        result[f"{key}_seed_std"] = 0.0
-        result[f"{key}_std"] = q_std  # backwards-compatible alias
+    if not compute_dynamics:
+        for key in DYNAMICS_METRICS:
+            result[key] = None
+            result[f"{key}_query_std"] = None
 
     return result
 
@@ -642,6 +767,18 @@ def run_single_seed_experiment(
         generator=generator,
     )
 
+    # One perturbation sample per query, shared by every beta (paired comparison).
+    perturbation = (
+        sample_perturbations(
+            queries.shape,
+            cfg["perturbation_noise"],
+            generator=generator,
+            dtype=queries.dtype,
+        )
+        if cfg["compute_dynamics"]
+        else None
+    )
+
     results: list[dict[str, Any]] = []
     for beta in cfg["beta_values"]:
         row = evaluate_cluster_retrieval(
@@ -653,8 +790,9 @@ def run_single_seed_experiment(
             beta=beta,
             num_updates=cfg["num_updates"],
             normalize=cfg["normalize"],
-            compute_dynamics=True,
-            generator=generator,
+            compute_dynamics=cfg["compute_dynamics"],
+            perturbation=perturbation,
+            perturbation_steps=cfg["perturbation_steps"],
         )
         results.append(row)
 
@@ -672,9 +810,78 @@ def run_single_seed_experiment(
         "beta_values": cfg["beta_values"],
         "normalize": cfg["normalize"],
         "num_updates": cfg["num_updates"],
+        "compute_dynamics": cfg["compute_dynamics"],
+        "perturbation_noise": cfg["perturbation_noise"],
+        "perturbation_steps": cfg["perturbation_steps"],
+        "perturbation_pairing": "one sample per query per seed, shared across all beta values",
+        "regime_thresholds": {
+            "single_memory_top1_mass": SINGLE_MEMORY_THRESHOLD,
+            "cluster_max_cluster_mass": CLUSTER_THRESHOLD,
+            "global_normalized_entropy": GLOBAL_UNIFORMITY_THRESHOLD,
+        },
     }
 
     return results, metadata
+
+
+def aggregate_seed_results(
+    per_seed_results: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Aggregate per-seed beta sweeps (each list aligned on beta) into one row per beta.
+
+    For every metric k that carries a per-seed ``k_query_std``:
+        k                              mean across seeds of the per-seed query means
+        k_seed_std                     sample std across seeds of the per-seed query means
+        k_mean_within_seed_query_std   average over seeds of each seed's query std.
+                                       This is an average of within-seed spreads,
+                                       not a pooled query standard deviation.
+
+    A statistic is None when any seed lacks the underlying value (dynamics not
+    evaluated, a single query per seed) or when fewer than two seeds are given.
+    """
+    num_seeds = len(per_seed_results)
+    first_sweep = per_seed_results[0]
+    metric_keys = [
+        k[: -len("_query_std")] for k in first_sweep[0] if k.endswith("_query_std")
+    ]
+
+    aggregated: list[dict[str, Any]] = []
+    for b_idx, first_row in enumerate(first_sweep):
+        agg_row: dict[str, Any] = {
+            "beta": first_row["beta"],
+            "seed_count": num_seeds,
+            "query_count": first_row["query_count"],
+            "dynamics_evaluated": first_row["dynamics_evaluated"],
+        }
+        for k in metric_keys:
+            seed_vals = [sweep[b_idx][k] for sweep in per_seed_results]
+            query_stds = [sweep[b_idx][f"{k}_query_std"] for sweep in per_seed_results]
+
+            if any(v is None for v in seed_vals):
+                mean_val = seed_std = None
+            else:
+                mean_val = sum(seed_vals) / num_seeds
+                seed_std = (
+                    math.sqrt(sum((v - mean_val) ** 2 for v in seed_vals) / (num_seeds - 1))
+                    if num_seeds > 1
+                    else None
+                )
+            mean_query_std = (
+                None if any(s is None for s in query_stds) else sum(query_stds) / num_seeds
+            )
+
+            agg_row[k] = mean_val
+            agg_row[f"{k}_seed_std"] = seed_std
+            agg_row[f"{k}_mean_within_seed_query_std"] = mean_query_std
+
+        regime_fractions = {
+            label: agg_row[REGIME_FRACTION_KEYS[label]] for label in REGIME_LABELS
+        }
+        agg_row["regime_fractions"] = regime_fractions
+        agg_row["regime"] = max(regime_fractions, key=lambda k: regime_fractions[k])
+        aggregated.append(agg_row)
+
+    return aggregated
 
 
 def run_benchmark(
@@ -682,7 +889,12 @@ def run_benchmark(
     output_dir: Path | None = None,
     save_plot: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run cluster retrieval benchmark across single or multiple random seeds."""
+    """Run cluster retrieval benchmark across single or multiple random seeds.
+
+    With one seed, rows carry ``k`` and ``k_query_std``. With several seeds,
+    rows are produced by ``aggregate_seed_results`` and per-seed rows are saved
+    alongside them.
+    """
     cfg = validate_cluster_config(config)
 
     seeds = cfg.get("seeds")
@@ -704,68 +916,9 @@ def run_benchmark(
         final_results = all_seed_results[0]
         final_metadata = first_metadata
     else:
-        # Aggregate across seeds
-        final_results = []
-        num_betas = len(cfg["beta_values"])
-        metric_keys = [
-            "target_cluster_mass",
-            "wrong_cluster_mass",
-            "max_cluster_mass",
-            "top1_mass",
-            "entropy",
-            "cluster_entropy",
-            "distance_to_cluster",
-            "distance_to_nearest_memory",
-            "top1_in_target_cluster",
-            "effective_memory_count",
-            "effective_cluster_count",
-            "dynamics_residual",
-            "perturbation_return_dist",
-            "perturbation_contraction_ratio",
-            "correct_cluster_fraction",
-            "wrong_cluster_fraction",
-            "wrong_cluster_concentration_fraction",
-            "correct_cluster_concentration_fraction",
-            "correct_single_memory_fraction",
-            "wrong_single_memory_fraction",
-            "fraction_global_averaging",
-            "fraction_cluster_averaging",
-            "fraction_single_memory",
-        ]
-
-        for b_idx in range(num_betas):
-            beta = cfg["beta_values"][b_idx]
-            agg_row: dict[str, Any] = {
-                "beta": beta,
-                "seed_count": len(seeds),
-                "query_count": cfg["num_queries"],
-            }
-            for k in metric_keys:
-                seed_vals = [seed_res[b_idx][k] for seed_res in all_seed_results]
-                mean_val = float(sum(seed_vals) / len(seed_vals))
-                variance = float(sum((v - mean_val) ** 2 for v in seed_vals) / (len(seed_vals) - 1)) if len(seed_vals) > 1 else 0.0
-                seed_std = float(variance ** 0.5)
-
-                query_stds = [seed_res[b_idx].get(f"{k}_query_std", 0.0) for seed_res in all_seed_results]
-                mean_query_std = float(sum(query_stds) / len(query_stds))
-
-                agg_row[k] = mean_val
-                agg_row[f"{k}_seed_std"] = seed_std
-                agg_row[f"{k}_query_std"] = mean_query_std
-                agg_row[f"{k}_std"] = seed_std  # backwards-compatible alias
-
-            # Determine dominant regime across seeds
-            regime_fractions = {
-                "Global Averaging": agg_row["fraction_global_averaging"],
-                "Cluster Averaging": agg_row["fraction_cluster_averaging"],
-                "Single Memory": agg_row["fraction_single_memory"],
-            }
-            agg_row["regime_fractions"] = regime_fractions
-            agg_row["regime"] = max(regime_fractions, key=lambda k: regime_fractions[k])
-            final_results.append(agg_row)
-
+        final_results = aggregate_seed_results(all_seed_results)
         final_metadata = {
-            **first_metadata,
+            **{k: v for k, v in first_metadata.items() if k != "seed"},
             "seeds": seeds,
             "num_seeds": len(seeds),
         }
@@ -845,9 +998,17 @@ def print_cluster_results_table(
         print(f"\nExperimental Setup: {num_clusters} clusters, {mem_per_cluster} memories/cluster (Total: {tot_mem} memories).")
         print(f"Theoretical limits: Uniform mass across clusters = {1.0 / num_clusters:.4f}, Uniform mass across all memories = {1.0 / tot_mem:.4f}.")
     print("\nQualitative Transition Regimes:")
-    print("  1. LOW beta:      Global Averaging (attention spread broadly across clusters, high entropy).")
-    print("  2. MEDIUM beta:   Cluster Averaging (attention focused within target cluster; candidate metastable state).")
-    print("  3. HIGH beta:     Single-Memory Concentration (top-1 mass dominates, distance to nearest memory -> 0).\n")
+    print(
+        "  1. LOW beta:      Global Averaging (near-uniform attention, "
+        f"normalized entropy >= {GLOBAL_UNIFORMITY_THRESHOLD:.2f})."
+    )
+    print("  2. MEDIUM beta:   Cluster Averaging (attention focused within one cluster; candidate metastable state).")
+    print("  3. HIGH beta:     Single-Memory Concentration (top-1 mass dominates, distance to nearest memory -> 0).")
+    print("  Broad/Mixed:      concentrated, but on no single memory or cluster (e.g. split across clusters).")
+    print(
+        "  Trajectory separation ratios are empirical evidence under the tested "
+        "perturbations, not proof of basin stability.\n"
+    )
 
 
 def save_reports(
@@ -911,6 +1072,23 @@ def save_reports(
                     writer.writerow(fr)
 
 
+def metric_uncertainty(results: list[dict[str, Any]], metric: str) -> list[float] | None:
+    """Return the per-beta std series used for a metric's uncertainty band, or None.
+
+    Seed std is used for multi-seed rows and query std for single-seed rows.
+    Availability is decided per metric: a band is returned only when every row
+    has a finite std for this metric and at least one is non-zero.
+    """
+    stds: list[float] = []
+    for r in results:
+        suffix = "_seed_std" if r.get("seed_count", 1) > 1 else "_query_std"
+        value = r.get(f"{metric}{suffix}")
+        if value is None or not math.isfinite(value):
+            return None
+        stds.append(float(value))
+    return stds if any(s > 1e-12 for s in stds) else None
+
+
 def plot_cluster_benchmark(
     results: list[dict[str, Any]],
     output_path: Path,
@@ -938,13 +1116,20 @@ def plot_cluster_benchmark(
     dist_memories = [r["distance_to_nearest_memory"] for r in results]
 
     has_seeds = any(r.get("seed_count", 1) > 1 for r in results)
-    std_key = "_seed_std" if has_seeds else "_query_std"
-    has_variance = any(r.get(f"target_cluster_mass{std_key}", 0.0) > 1e-6 for r in results)
-    uncertainty_desc = (
-        f"Mean \u00b1 1 std ({'seeds' if has_seeds else 'queries'})"
-        if has_variance
-        else "Mean-only trajectories"
-    )
+    spread_source = "seeds" if has_seeds else "queries"
+
+    def add_band(ax: Any, metric: str, means: list[float], color: str, alpha: float) -> bool:
+        stds = metric_uncertainty(results, metric)
+        if stds is None:
+            return False
+        ax.fill_between(
+            betas,
+            [m - s for m, s in zip(means, stds)],
+            [m + s for m, s in zip(means, stds)],
+            color=color,
+            alpha=alpha,
+        )
+        return True
 
     num_clusters = cfg.get("num_clusters", 4) if cfg else 4
     mem_per_cluster = cfg.get("memories_per_cluster", 10) if cfg else 10
@@ -952,7 +1137,8 @@ def plot_cluster_benchmark(
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(
-        f"Hopfield Memory: Cluster Retrieval Transition across \u03b2 ({uncertainty_desc})",
+        "Hopfield Memory: Cluster Retrieval Transition across \u03b2\n"
+        f"(shaded where available: mean \u00b1 1 std across {spread_source})",
         fontsize=14,
         fontweight="bold",
     )
@@ -960,16 +1146,7 @@ def plot_cluster_benchmark(
     # Panel 1: Target Cluster Mass
     ax = axes[0, 0]
     ax.plot(betas, cluster_masses, marker="o", color="#1f77b4", linewidth=2.2, label="Target Cluster Mass")
-    if has_variance:
-        stds = [r.get(f"target_cluster_mass{std_key}", 0.0) for r in results]
-        ax.fill_between(
-            betas,
-            [m - s for m, s in zip(cluster_masses, stds)],
-            [m + s for m, s in zip(cluster_masses, stds)],
-            color="#1f77b4",
-            alpha=0.2,
-            label=f"\u00b11 std ({'seed' if has_seeds else 'query'})",
-        )
+    add_band(ax, "target_cluster_mass", cluster_masses, "#1f77b4", 0.2)
     ax.axhline(
         1.0 / num_clusters,
         color="#7f7f7f",
@@ -988,15 +1165,7 @@ def plot_cluster_benchmark(
     # Panel 2: Top-1 Memory Mass
     ax = axes[0, 1]
     ax.plot(betas, top1_masses, marker="s", color="#d62728", linewidth=2.2, label=r"Top-1 Mass ($\max_i p_i$)")
-    if has_variance:
-        stds = [r.get(f"top1_mass{std_key}", 0.0) for r in results]
-        ax.fill_between(
-            betas,
-            [m - s for m, s in zip(top1_masses, stds)],
-            [m + s for m, s in zip(top1_masses, stds)],
-            color="#d62728",
-            alpha=0.2,
-        )
+    add_band(ax, "top1_mass", top1_masses, "#d62728", 0.2)
     ax.axhline(
         1.0 / total_memories,
         color="#7f7f7f",
@@ -1023,11 +1192,8 @@ def plot_cluster_benchmark(
     ax = axes[1, 0]
     ax.plot(betas, mem_entropies, marker="^", color="#ff7f0e", linewidth=2.2, label="Memory Entropy (all memories)")
     ax.plot(betas, clus_entropies, marker="v", color="#9467bd", linewidth=2.2, linestyle="--", label="Cluster Entropy (inter-cluster)")
-    if has_variance:
-        m_stds = [r.get(f"entropy{std_key}", 0.0) for r in results]
-        ax.fill_between(betas, [m - s for m, s in zip(mem_entropies, m_stds)], [m + s for m, s in zip(mem_entropies, m_stds)], color="#ff7f0e", alpha=0.15)
-        c_stds = [r.get(f"cluster_entropy{std_key}", 0.0) for r in results]
-        ax.fill_between(betas, [m - s for m, s in zip(clus_entropies, c_stds)], [m + s for m, s in zip(clus_entropies, c_stds)], color="#9467bd", alpha=0.15)
+    add_band(ax, "entropy", mem_entropies, "#ff7f0e", 0.15)
+    add_band(ax, "cluster_entropy", clus_entropies, "#9467bd", 0.15)
     ax.set_xscale("log")
     ax.set_xlabel(r"Inverse Temperature $\beta$ (log scale)")
     ax.set_ylabel("Shannon Entropy")
@@ -1035,7 +1201,7 @@ def plot_cluster_benchmark(
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.6)
 
-    # Panel 4: Distances (Generating Prototype vs Nearest Stored Memory)
+    # Panel 4: Retrieved-state distances to generating prototype and nearest stored memory
     ax = axes[1, 1]
     ax.plot(
         betas,
@@ -1043,7 +1209,7 @@ def plot_cluster_benchmark(
         marker="o",
         color="#17becf",
         linewidth=2.2,
-        label="Distance to Generating Prototype",
+        label="Retrieved State to Generating Prototype",
     )
     ax.plot(
         betas,
@@ -1051,17 +1217,14 @@ def plot_cluster_benchmark(
         marker="D",
         color="#8c564b",
         linewidth=2.2,
-        label="Distance to Nearest Memory",
+        label="Retrieved State to Nearest Stored Memory",
     )
-    if has_variance:
-        dc_stds = [r.get(f"distance_to_cluster{std_key}", 0.0) for r in results]
-        ax.fill_between(betas, [m - s for m, s in zip(dist_clusters, dc_stds)], [m + s for m, s in zip(dist_clusters, dc_stds)], color="#17becf", alpha=0.15)
-        dm_stds = [r.get(f"distance_to_nearest_memory{std_key}", 0.0) for r in results]
-        ax.fill_between(betas, [m - s for m, s in zip(dist_memories, dm_stds)], [m + s for m, s in zip(dist_memories, dm_stds)], color="#8c564b", alpha=0.15)
+    add_band(ax, "distance_to_cluster", dist_clusters, "#17becf", 0.15)
+    add_band(ax, "distance_to_nearest_memory", dist_memories, "#8c564b", 0.15)
     ax.set_xscale("log")
     ax.set_xlabel(r"Inverse Temperature $\beta$ (log scale)")
     ax.set_ylabel("Euclidean Distance (L2)")
-    ax.set_title(r"State Convergence: Generating Prototype $\to$ Memory Attractor")
+    ax.set_title(r"Retrieved-State Distances across $\beta$")
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.6)
 
@@ -1130,7 +1293,11 @@ def main() -> None:
         "--cluster-separation",
         type=float,
         default=None,
-        help="Override separation distance between cluster centers.",
+        help=(
+            "Override the Euclidean norm of each cluster prototype. When "
+            "num_clusters <= dim the prototypes are orthogonal, so distinct "
+            "prototypes are sqrt(2) * this value apart."
+        ),
     )
     parser.add_argument(
         "--cluster-noise",
@@ -1155,6 +1322,23 @@ def main() -> None:
         type=int,
         default=None,
         help="Override target cluster index (default: 0).",
+    )
+    parser.add_argument(
+        "--perturbation-noise",
+        type=float,
+        default=None,
+        help="Override std of the Gaussian state perturbation used for trajectory separation.",
+    )
+    parser.add_argument(
+        "--perturbation-steps",
+        type=int,
+        default=None,
+        help="Override number of updates applied to perturbed and unperturbed trajectories.",
+    )
+    parser.add_argument(
+        "--no-dynamics",
+        action="store_true",
+        help="Skip dynamics diagnostics (reported as null with dynamics_evaluated=False).",
     )
     parser.add_argument(
         "--no-plot",
@@ -1199,6 +1383,12 @@ def main() -> None:
         config["num_queries"] = args.num_queries
     if args.target_cluster is not None:
         config["target_cluster"] = args.target_cluster
+    if args.perturbation_noise is not None:
+        config["perturbation_noise"] = args.perturbation_noise
+    if args.perturbation_steps is not None:
+        config["perturbation_steps"] = args.perturbation_steps
+    if args.no_dynamics:
+        config["compute_dynamics"] = False
 
     output_dir = args.output_dir
     if output_dir is None:
