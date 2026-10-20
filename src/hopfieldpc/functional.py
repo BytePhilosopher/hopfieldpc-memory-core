@@ -20,7 +20,7 @@ from typing import Literal, overload
 import torch
 import torch.nn.functional as F
 
-from .api import validate_query_memory
+from .api import validate_beta, validate_query_memory
 
 
 def _normalize_for_scores(
@@ -56,7 +56,8 @@ def hopfield_retrieve(
             Memory bank tensor with shape [num_memories, dim].
             Each row is one stored pattern.
         beta:
-            Retrieval sharpness. Larger beta produces sharper memory selection.
+            Finite positive retrieval sharpness. Larger beta produces sharper
+            memory selection.
         normalize:
             If True, query and memory are L2-normalized for similarity scoring.
             The retrieved vector is still computed from the original memory.
@@ -73,21 +74,37 @@ def hopfield_retrieve(
         retrieved = weights @ memory
     """
 
-    if beta <= 0:
-        raise ValueError(f"beta must be positive, got {beta!r}.")
+    beta = validate_beta(beta)
 
     validate_query_memory(query=query, memory=memory)
 
+    input_dtype = query.dtype
+    working_dtype = (
+        torch.float32
+        if input_dtype in (torch.float16, torch.bfloat16)
+        else input_dtype
+    )
+    query_work = query.to(dtype=working_dtype)
+    memory_work = memory.to(dtype=working_dtype)
+
     if normalize:
-        query_for_scores, memory_for_scores = _normalize_for_scores(query, memory)
+        query_for_scores, memory_for_scores = _normalize_for_scores(
+            query_work, memory_work
+        )
     else:
-        query_for_scores, memory_for_scores = query, memory
+        query_for_scores, memory_for_scores = query_work, memory_work
 
-    scores = beta * torch.matmul(query_for_scores, memory_for_scores.transpose(0, 1))
-    weights = torch.softmax(scores, dim=-1)
-    retrieved = torch.matmul(weights, memory)
+    similarities = torch.matmul(query_for_scores, memory_for_scores.transpose(0, 1))
+    # Center before beta scaling to prevent positive overflow without changing softmax.
+    similarities = similarities - similarities.amax(dim=-1, keepdim=True)
+    scores = beta * similarities
+    weights_work = torch.softmax(scores, dim=-1)
+    retrieved_work = torch.matmul(weights_work, memory_work)
 
-    return retrieved, weights
+    return (
+        retrieved_work.to(dtype=input_dtype),
+        weights_work.to(dtype=input_dtype),
+    )
 
 
 @overload

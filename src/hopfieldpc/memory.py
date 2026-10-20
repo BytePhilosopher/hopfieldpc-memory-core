@@ -6,7 +6,12 @@ from typing import Any
 import torch
 from torch import nn
 
-from .api import HopfieldMemoryOutput, HopfieldShapeContract, validate_query_memory
+from .api import (
+    HopfieldMemoryOutput,
+    HopfieldShapeContract,
+    validate_beta,
+    validate_query_memory,
+)
 from .diagnostics import build_retrieval_diagnostics
 from .functional import multi_step_retrieve
 
@@ -57,8 +62,7 @@ class HopfieldMemory(nn.Module):
                 f"memory_size must be None or a positive integer, got {memory_size!r}."
             )
 
-        if beta <= 0:
-            raise ValueError(f"beta must be positive, got {beta!r}.")
+        beta = validate_beta(beta)
 
         if (
             isinstance(num_updates, bool)
@@ -84,7 +88,7 @@ class HopfieldMemory(nn.Module):
 
         self.dim = dim
         self.memory_size = memory_size
-        self.beta = float(beta)
+        self.beta = beta
         self.num_updates = num_updates
         self.learnable_memory = bool(learnable_memory)
         self.normalize = bool(normalize)

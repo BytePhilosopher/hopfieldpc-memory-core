@@ -6,6 +6,8 @@ module. Retrieval operations are implemented separately in functional.py.
 
 from __future__ import annotations
 
+import math
+import numbers
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -57,6 +59,20 @@ def _require_tensor(name: str, value: object) -> torch.Tensor:
     return value
 
 
+def validate_beta(beta: object) -> float:
+    """Return beta as a finite positive float."""
+
+    if (
+        isinstance(beta, bool)
+        or not isinstance(beta, numbers.Real)
+        or not math.isfinite(beta)
+        or beta <= 0
+    ):
+        raise ValueError(f"beta must be positive and finite, got {beta!r}.")
+
+    return float(beta)
+
+
 def validate_query_memory(
     query: torch.Tensor,
     memory: torch.Tensor,
@@ -82,13 +98,26 @@ def validate_query_memory(
 
     Raises:
         TypeError:
-            If query or memory is not a torch.Tensor.
+            If query or memory is not a floating-point torch.Tensor, or their
+            dtypes differ.
         HopfieldShapeError:
             If tensor ranks or dimensions are invalid.
     """
 
     query = _require_tensor("query", query)
     memory = _require_tensor("memory", memory)
+
+    if not query.is_floating_point() or not memory.is_floating_point():
+        raise TypeError(
+            "query and memory must be floating-point tensors, "
+            f"got {query.dtype} and {memory.dtype}."
+        )
+
+    if query.dtype != memory.dtype:
+        raise TypeError(
+            "query and memory must share a dtype, "
+            f"got {query.dtype} and {memory.dtype}."
+        )
 
     if query.ndim != 2:
         raise HopfieldShapeError(

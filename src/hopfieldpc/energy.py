@@ -13,7 +13,7 @@ import math
 
 import torch
 
-from .api import validate_query_memory
+from .api import validate_beta, validate_query_memory
 
 
 def hopfield_energy(
@@ -29,7 +29,8 @@ def hopfield_energy(
     Args:
         query: Query tensor with shape [batch_size, dim].
         memory: Memory bank tensor with shape [num_memories, dim].
-        beta: Retrieval sharpness (inverse temperature). Must be positive.
+        beta: Retrieval sharpness (inverse temperature). Must be positive
+            and finite.
         include_constants: If True, include the quadratic query term (½‖q‖²),
             the memory bounding term (½M²), and the log-capacity offset
             ((1/β)·log(N)) from the full Hopfield energy.
@@ -40,16 +41,19 @@ def hopfield_energy(
         Hopfield energy tensor.
     """
 
-    if beta <= 0:
-        raise ValueError(f"beta must be positive, got {beta!r}.")
+    beta = validate_beta(beta)
 
     if reduce not in ("none", "mean"):
         raise ValueError(f"reduce must be 'none' or 'mean', got {reduce!r}.")
 
     validate_query_memory(query=query, memory=memory)
 
-    scores = beta * torch.matmul(query, memory.transpose(0, 1))
-    energy = -(1.0 / beta) * torch.logsumexp(scores, dim=-1)
+    similarities = torch.matmul(query, memory.transpose(0, 1))
+    # Same as -logsumexp(beta * similarities) / beta, but beta never scales the
+    # uncentered similarities, so large scores cannot overflow.
+    max_similarity = similarities.amax(dim=-1, keepdim=True)
+    log_sum = torch.logsumexp(beta * (similarities - max_similarity), dim=-1)
+    energy = -max_similarity.squeeze(-1) - log_sum / beta
 
     if include_constants:
         num_memories = memory.shape[0]
