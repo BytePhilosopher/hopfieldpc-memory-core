@@ -1,0 +1,22 @@
+seed: 42
+dim: 64
+num_clusters: 4
+memories_per_cluster: 10
+cluster_separation: 3.0
+cluster_noise: 0.15
+query_noise: 0.10
+num_queries: 50
+target_cluster: 0
+
+beta_values: [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+
+normalize: false
+num_updates: 1
+
+# Dynamics diagnostics: one perturbation sample per query per seed, shared across betas.
+compute_dynamics: true
+perturbation_noise: 0.05
+perturbation_steps: 3
+
+reports_dir: "reports/cluster_retrieval"
+save_plot: true
