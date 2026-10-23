@@ -35,8 +35,11 @@ def hopfield_energy(
             Ramsauer et al. (2020): ½‖q‖², ½M² and (1/β)·log(N). Only the last two
             are constants. ½‖q‖² depends on q, so with the default False the value
             is NOT the energy that retrieval descends and it can rise during
-            retrieval. Use include_constants=True (or hopfield_full_energy)
-            whenever energy descent or gradients matter.
+            retrieval. Use include_constants=True whenever energy descent or
+            gradients matter. For unnormalized retrieval (normalize=False) with a
+            fixed memory and finite positive beta, dE/dq = q - retrieved(q), so one
+            retrieval update is a unit gradient step on this energy and cannot
+            increase it. With normalize=True this guarantee does not apply.
         reduce: ``"none"`` returns per-query energy [batch_size],
                 ``"mean"`` returns the scalar batch mean.
 
@@ -70,23 +73,3 @@ def hopfield_energy(
         return energy.mean()
 
     return energy
-
-
-def hopfield_full_energy(
-    query: torch.Tensor,
-    memory: torch.Tensor,
-    beta: float = 1.0,
-    *,
-    reduce: str = "none",
-) -> torch.Tensor:
-    """Full modern Hopfield energy, including the query-dependent term ½‖q‖².
-
-    Same as hopfield_energy(..., include_constants=True).
-
-    For unnormalized retrieval (normalize=False) with a fixed memory and a finite,
-    positive beta, dE/dq = q - retrieved(q). One retrieval update is therefore a unit
-    gradient step on this energy and cannot increase it. With normalize=True the
-    retrieval scores differ, so this guarantee does not apply.
-    """
-
-    return hopfield_energy(query, memory, beta, include_constants=True, reduce=reduce)
