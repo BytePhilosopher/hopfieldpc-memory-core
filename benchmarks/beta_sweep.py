@@ -14,6 +14,7 @@ import torch
 import yaml
 
 from benchmarks.synthetic_retrieval import generate_memory, generate_noisy_queries
+from benchmarks.validation import validate_beta_values
 from hopfieldpc.diagnostics import (
     attention_entropy,
     max_attention_weight,
@@ -129,14 +130,7 @@ def validate_beta_sweep_config(config: dict[str, Any]) -> dict[str, Any]:
     noise_level = float(raw_noise)
 
     beta_values = config.get("beta_values", DEFAULT_BETAS)
-    if not isinstance(beta_values, list) or len(beta_values) == 0:
-        raise ValueError("beta_values must be a non-empty list of positive floats.")
-
-    resolved_betas: list[float] = []
-    for b in beta_values:
-        if isinstance(b, bool) or not isinstance(b, (int, float)) or b <= 0:
-            raise ValueError(f"All beta_values must be positive numbers, got {b!r}.")
-        resolved_betas.append(float(b))
+    resolved_betas = validate_beta_values(beta_values)
 
     normalize = bool(config.get("normalize", False))
 
