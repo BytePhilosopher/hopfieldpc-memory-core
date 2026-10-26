@@ -52,12 +52,13 @@ DYNAMICS_METRICS = (
 
 
 def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalize configuration parameters for cluster retrieval."""
+    """Validate and normalize configuration, rejecting duplicate seed entries."""
     if not isinstance(config, dict):
         raise TypeError(
             f"Configuration must be a dictionary/mapping, got {type(config).__name__}."
         )
 
+    # Initialize the scalar fallback before handling an optional seed list.
     seed = config.get("seed", 42)
     if (
         isinstance(seed, bool)
@@ -73,6 +74,8 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(seeds_raw, list) or len(seeds_raw) == 0:
             raise ValueError("seeds must be a non-empty list of non-negative integers.")
         resolved_seeds = []
+        seen_seeds: set[int] = set()
+
         for s in seeds_raw:
             if (
                 isinstance(s, bool)
@@ -81,6 +84,15 @@ def validate_cluster_config(config: dict[str, Any]) -> dict[str, Any]:
                 or s < 0
             ):
                 raise ValueError(f"All seeds must be non-negative integers, got {s!r}.")
+
+            # Reject repeated runs without changing the configured seed order.
+            if s in seen_seeds:
+                raise ValueError(
+                    "seeds must contain unique values; "
+                    f"duplicate seed {s!r} would repeat the same experiment."
+                )
+
+            seen_seeds.add(s)
             resolved_seeds.append(s)
 
     dim = config.get("dim", 64)

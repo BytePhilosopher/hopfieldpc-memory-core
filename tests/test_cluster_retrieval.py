@@ -1023,3 +1023,92 @@ def test_format_results_table() -> None:
     assert "beta" in table
     assert "cluster_mass" in table
     assert "Global Averaging" in table
+
+
+@pytest.mark.parametrize(
+    "seeds, duplicate",
+    [
+        ([11, 11], 11),
+        ([11, 22, 11], 11),
+        ([42, 42, 42], 42),
+        ([0, 0], 0),
+    ],
+)
+def test_seed_validation_rejects_duplicate_seeds(
+    seeds: list[int], duplicate: int
+) -> None:
+    """Duplicate seed IDs must not count as separate seed replicates."""
+    with pytest.raises(
+        ValueError,
+        match=f"seeds must contain unique values; duplicate seed {duplicate}",
+    ):
+        validate_cluster_config({"seeds": seeds})
+
+
+@pytest.mark.parametrize("seeds", [[33, 11, 22], [0, 1], [11]])
+def test_seed_validation_preserves_unique_seed_order(seeds: list[int]) -> None:
+    """Accept unique seed lists without sorting or mutating the input."""
+    original_order = seeds.copy()
+
+    cfg = validate_cluster_config({"seeds": seeds})
+
+    assert cfg["seeds"] == original_order
+    assert seeds == original_order
+
+
+@pytest.mark.parametrize(
+    "config, expected_seed",
+    [
+        ({}, 42),
+        ({"seed": 11}, 11),
+        ({"seed": 11, "seeds": None}, 11),
+    ],
+)
+def test_seed_validation_preserves_single_seed_fallback(
+    config: dict[str, Any], expected_seed: int
+) -> None:
+    """Omitted or None seed lists retain the existing scalar-seed fallback."""
+    cfg = validate_cluster_config(config)
+
+    assert cfg["seed"] == expected_seed
+    assert cfg["seeds"] is None
+
+
+def test_seed_validation_accepts_scalar_seed_overlap() -> None:
+    """The scalar fallback is not an extra replicate of an explicit seed list."""
+    cfg = validate_cluster_config({"seed": 11, "seeds": [11, 22]})
+
+    assert cfg["seed"] == 11
+    assert cfg["seeds"] == [11, 22]
+
+
+@pytest.mark.parametrize("seeds", [[True, 1], [1, True], [11, 11.0], [11, -1]])
+def test_seed_validation_preserves_seed_element_checks(seeds: list[Any]) -> None:
+    """Validate element types and ranges before checking membership in the set."""
+    with pytest.raises(ValueError, match="All seeds must be non-negative integers"):
+        validate_cluster_config({"seeds": seeds})
+
+
+def test_seed_validation_rejects_duplicates_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Duplicate seeds fail before experiments run or reports are written."""
+
+    def unexpected_run(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("An experiment ran before duplicate seeds were rejected.")
+
+    monkeypatch.setattr(
+        "benchmarks.cluster_retrieval.run_single_seed_experiment",
+        unexpected_run,
+    )
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(ValueError, match="seeds must contain unique values"):
+        run_benchmark(
+            {"seeds": [11, 11, 22]},
+            output_dir=output_dir,
+            save_plot=False,
+        )
+
+    assert not output_dir.exists()
