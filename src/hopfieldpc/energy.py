@@ -5,6 +5,11 @@ Implements the modern continuous Hopfield energy (Ramsauer et al., 2020):
     E(q, M, β) = -(1/β) · logsumexp(β · q Mᵀ) + ½ ‖q‖² + ½ M² + (1/β) · log(N)
 
 where M = max_i ‖mᵢ‖ is the largest memory norm.
+
+hopfield_energy always includes -(1/β)·logsumexp(β q Mᵀ) and ½‖q‖², the two
+terms that depend on q. Its gradient with respect to q is q - retrieved(q).
+include_constants=True adds only the two q-independent terms, ½ M² and
+(1/β)·log(N), which shift the value but not the gradient.
 """
 
 from __future__ import annotations
