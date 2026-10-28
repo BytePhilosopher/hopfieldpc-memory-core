@@ -26,20 +26,24 @@ def hopfield_energy(
 ) -> torch.Tensor:
     """Compute modern Hopfield energy for each query.
 
+    The energy is -(1/β)·logsumexp(β q Mᵀ) + ½‖q‖². Its gradient with respect
+    to q is q - retrieved(q), so one retrieval step is a unit gradient step and
+    cannot raise it. This holds for a fixed memory, a fixed beta and
+    unnormalized retrieval (normalize=False), with or without the optional
+    constants.
+
+    Changed: earlier versions left ½‖q‖² out unless include_constants=True.
+    That term depends on q, so the old default could rise during correct
+    retrieval. The default value is now ½‖q‖² higher than before.
+
     Args:
         query: Query tensor with shape [batch_size, dim].
         memory: Memory bank tensor with shape [num_memories, dim].
         beta: Retrieval sharpness (inverse temperature). Must be positive
             and finite.
-        include_constants: If True, add the terms that complete the full energy of
-            Ramsauer et al. (2020): ½‖q‖², ½M² and (1/β)·log(N). Only the last two
-            are constants. ½‖q‖² depends on q, so with the default False the value
-            is NOT the energy that retrieval descends and it can rise during
-            retrieval. Use include_constants=True whenever energy descent or
-            gradients matter. For unnormalized retrieval (normalize=False) with a
-            fixed memory and finite positive beta, dE/dq = q - retrieved(q), so one
-            retrieval update is a unit gradient step on this energy and cannot
-            increase it. With normalize=True this guarantee does not apply.
+        include_constants: If True, also add the two terms that do not depend on
+            q: (1/β)·log(N) and ½·max_i‖mᵢ‖². They shift the value but not its
+            gradient, so they never affect convergence checks.
         reduce: ``"none"`` returns per-query energy [batch_size],
                 ``"mean"`` returns the scalar batch mean.
 
@@ -59,15 +63,16 @@ def hopfield_energy(
     # uncentered similarities, so large scores cannot overflow.
     max_similarity = similarities.amax(dim=-1, keepdim=True)
     log_sum = torch.logsumexp(beta * (similarities - max_similarity), dim=-1)
-    energy = -max_similarity.squeeze(-1) - log_sum / beta
+    energy = (
+        -max_similarity.squeeze(-1)
+        - log_sum / beta
+        + 0.5 * (query ** 2).sum(dim=-1)
+    )
 
     if include_constants:
-        num_memories = memory.shape[0]
-        query_norm_sq = 0.5 * (query ** 2).sum(dim=-1)
-        log_n_term = (1.0 / beta) * math.log(num_memories)
-        max_memory_norm_sq = (memory ** 2).sum(dim=-1).max()
-        memory_bound_term = 0.5 * max_memory_norm_sq
-        energy = energy + query_norm_sq + log_n_term + memory_bound_term
+        log_n_term = (1.0 / beta) * math.log(memory.shape[0])
+        memory_bound_term = 0.5 * (memory ** 2).sum(dim=-1).max()
+        energy = energy + log_n_term + memory_bound_term
 
     if reduce == "mean":
         return energy.mean()
