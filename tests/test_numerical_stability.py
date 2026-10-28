@@ -127,7 +127,8 @@ def test_energy_is_finite_when_beta_scaling_would_overflow() -> None:
     energy = hopfield_energy(query, memory, beta=100.0)
 
     assert torch.isfinite(energy).all()
-    torch.testing.assert_close(energy, -(query @ memory.T).amax(dim=-1))
+    expected = -(query @ memory.T).amax(dim=-1) + 0.5 * (query ** 2).sum(dim=-1)
+    torch.testing.assert_close(energy, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -143,7 +144,8 @@ def test_low_precision_energy_is_finite_for_large_scores(dtype: torch.dtype) -> 
     energy = hopfield_energy(query, memory, beta=100.0)
 
     assert energy.dtype == dtype
-    torch.testing.assert_close(energy, torch.tensor([-1600.0], dtype=dtype))
+    # -1600 from the best match, +800 from the query term.
+    torch.testing.assert_close(energy, torch.tensor([-800.0], dtype=dtype))
 
 
 @pytest.mark.parametrize("beta", [0.1, 1.0, 10.0])
@@ -155,7 +157,10 @@ def test_energy_matches_float64_reference(beta: float) -> None:
     memory = torch.randn(20, 16, generator=generator, dtype=torch.float64)
 
     energy = hopfield_energy(query, memory, beta=beta)
-    reference = -torch.logsumexp(beta * query @ memory.T, dim=-1) / beta
+    reference = (
+        -torch.logsumexp(beta * query @ memory.T, dim=-1) / beta
+        + 0.5 * (query ** 2).sum(dim=-1)
+    )
     (grad,) = torch.autograd.grad(energy.sum(), query)
     (reference_grad,) = torch.autograd.grad(reference.sum(), query)
 
