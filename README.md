@@ -146,8 +146,13 @@ Settings are in `configs/mnist_prototype_retrieval.yaml`. Outputs go to
 - `plots.png` (accuracy vs noise, β, T and retrieval confusion) and `cost.png` (latency and
   throughput vs batch, accuracy vs latency).
 
-The full write-up is in `docs/task13_mnist_report.md`. Timings only compare within one run, and on
-CPU peak memory is an activation upper bound.
+Result (10 seeds, β\* = 100): clean accuracy is unchanged (98.86 % vs 98.89 %, tie), while
+robustness AUC rises by +7.2 pp under Gaussian noise and +7.8 pp under salt-and-pepper noise,
+better in all 10 seeds (Wilcoxon p = 0.002). Occlusion shows no significant effect. The layer adds
+0 trainable parameters and +0.24 % MACs. A hard nearest-centered-prototype readout matches the
+Hopfield layer, so the gain comes from the memory design rather than from soft retrieval.
+
+Timings only compare within one run; on CPU, peak memory is an activation upper bound.
 
 ## Next Planned Tasks
 
