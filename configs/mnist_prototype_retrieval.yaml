@@ -8,10 +8,21 @@ device: "auto"            # auto | cpu | cuda
 val_size: 5000            # held out of train, used only to select beta
 train_subset: null        # null = all remaining train images
 test_subset: null         # null = all 10 000 test images
+# Untuned defaults; replaced by the baseline_tuning winner when tuning is enabled.
 epochs: 3
 batch_size: 128
 lr: 0.001
 eval_batch_size: 1000
+
+# Baseline grid search, run before any backbone is trained. Every epoch up to
+# max_epochs is a candidate (scored after each epoch of one run per lr x batch).
+# Score = mean validation head_acc over beta_selection_sets, i.e. the same
+# criterion that selects beta for the Hopfield variant. null disables tuning.
+baseline_tuning:
+  seeds: [0, 1]
+  lr_values: [0.0005, 0.001, 0.002]
+  batch_size_values: [64, 128]
+  max_epochs: 6
 
 # Hopfield memory (Ramsauer et al. 2020): prototypes centered by the train-mean
 # embedding, 8 k-means prototypes per class (paper Table A.3).
@@ -48,6 +59,11 @@ quick:
   reports_dir: "reports/mnist_prototype_retrieval_quick"   # never overwrite full checkpoints
   seeds: [0]
   epochs: 1
+  baseline_tuning:
+    seeds: [0]
+    lr_values: [0.001, 0.002]
+    batch_size_values: [128]
+    max_epochs: 2
   val_size: 500
   train_subset: 2000
   test_subset: 1000

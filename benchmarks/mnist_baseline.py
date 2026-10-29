@@ -30,7 +30,7 @@ import platform
 import statistics
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,9 +87,11 @@ CONFIG_KEYS = (
     "center_prototypes",
     "prototypes_per_class",
     "beta_selection_sets",
+    "baseline_tuning",
     "cost",
     "quick",
 )
+TUNING_KEYS = ("seeds", "lr_values", "batch_size_values", "max_epochs")
 SELECTION_KINDS = ("clean", *NOISE_TYPES)
 # Default memory protocol (Ramsauer et al. 2020): centered prototypes, 8 per class,
 # beta chosen on clean + noisy validation sets whose levels are not in the test grids.
@@ -234,6 +236,42 @@ def _validate_selection_sets(sets: Any) -> list[tuple[str, float]]:
     return resolved
 
 
+def _validate_tuning_config(tuning: Any) -> dict[str, Any] | None:
+    """Validate the baseline grid search (``null`` disables it).
+
+    The grid is lr x batch_size; every epoch up to ``max_epochs`` is a
+    candidate, scored from one training run per (lr, batch_size).
+    """
+    if tuning is None:
+        return None
+    if not isinstance(tuning, dict):
+        raise TypeError(f"baseline_tuning must be a mapping or null, got {type(tuning).__name__}.")
+    unknown = sorted(set(tuning) - set(TUNING_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown baseline_tuning keys: {unknown}.")
+
+    lr_values = tuning.get("lr_values", [5e-4, 1e-3, 2e-3])
+    if not isinstance(lr_values, list) or len(lr_values) == 0:
+        raise ValueError("baseline_tuning.lr_values must be a non-empty list of positive floats.")
+    lr_values = [
+        _require_float("baseline_tuning.lr_values", v, minimum=0.0, strict=True) for v in lr_values
+    ]
+    _require_ascending("baseline_tuning.lr_values", lr_values)
+
+    batch_sizes = tuning.get("batch_size_values", [64, 128])
+    if not isinstance(batch_sizes, list) or len(batch_sizes) == 0:
+        raise ValueError("baseline_tuning.batch_size_values must be a non-empty list of positive integers.")
+    batch_sizes = [_require_int("baseline_tuning.batch_size_values", b, minimum=1) for b in batch_sizes]
+    _require_ascending("baseline_tuning.batch_size_values", batch_sizes)
+
+    return {
+        "seeds": _require_seeds(tuning.get("seeds", [0])),
+        "lr_values": lr_values,
+        "batch_size_values": batch_sizes,
+        "max_epochs": _require_int("baseline_tuning.max_epochs", tuning.get("max_epochs", 6), minimum=1),
+    }
+
+
 def apply_quick_overrides(config: dict[str, Any]) -> dict[str, Any]:
     """Merge the ``quick`` section over the top-level config (``cost`` merges per key)."""
     quick = config.get("quick") or {}
@@ -361,6 +399,7 @@ def validate_mnist_config(config: dict[str, Any]) -> dict[str, Any]:
         "beta_selection_sets": _validate_selection_sets(
             config.get("beta_selection_sets", DEFAULT_SELECTION_SETS)
         ),
+        "baseline_tuning": _validate_tuning_config(config.get("baseline_tuning", None)),
         "cost": _validate_cost_config(config.get("cost", {})),
     }
 
@@ -715,8 +754,13 @@ def train_baseline(
     lr: float,
     seed: int,
     device: torch.device,
+    on_epoch_end: Callable[[int], None] | None = None,
 ) -> float:
-    """Train the baseline on clean images [N, 1, 28, 28] with Adam; return wall seconds."""
+    """Train the baseline on clean images [N, 1, 28, 28] with Adam; return wall seconds.
+
+    ``on_epoch_end(epoch)`` (1-based) runs after each epoch with the net in
+    eval mode; its time is included in the returned wall time.
+    """
     net.to(device).train()
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     generator = torch.Generator().manual_seed(seed)
@@ -735,6 +779,10 @@ def train_baseline(
             total_loss += loss.item() * idx.numel()
             total += idx.numel()
         print(f"    epoch {epoch + 1}/{epochs}  train loss {total_loss / max(total, 1):.4f}")
+        if on_epoch_end is not None:
+            net.eval()
+            on_epoch_end(epoch + 1)
+            net.train()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     net.eval()
@@ -801,6 +849,191 @@ def get_or_train_baseline(
         path,
     )
     return net.eval(), train_time_s, False
+
+
+# ---------------------------------------------------------------------------
+# Data-split table and baseline hyperparameter tuning
+# ---------------------------------------------------------------------------
+
+
+def split_table(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any]:
+    """Sizes and class balance of the train / validation / test splits.
+
+    Split sizes do not depend on the seed (only which images land in train or
+    validation does), so the first configured seed is representative.
+    """
+    splits = make_splits(
+        data,
+        seed=cfg["seeds"][0],
+        val_size=cfg["val_size"],
+        train_subset=cfg["train_subset"],
+        test_subset=cfg["test_subset"],
+    )
+    rows = []
+    for name, labels, source, use in (
+        ("train", splits.train_labels, "official train, seeded split",
+         "fit CNN weights; build prototype memory M"),
+        ("validation", splits.val_labels, "official train, seeded split",
+         "tune baseline (lr, batch, epochs) and β"),
+        ("test", splits.test_labels, "official test",
+         "final paired Baseline vs Hopfield comparison"),
+    ):
+        counts = torch.bincount(labels, minlength=NUM_CLASSES)
+        rows.append({
+            "split": name,
+            "images": int(labels.shape[0]),
+            "per_class_min": int(counts.min()),
+            "per_class_max": int(counts.max()),
+            "source": source,
+            "used_for": use,
+        })
+    return {"rows": rows, "seed": cfg["seeds"][0]}
+
+
+def format_split_table(table: dict[str, Any]) -> list[str]:
+    """Render ``split_table`` as fixed-width lines."""
+    total = sum(r["images"] for r in table["rows"])
+    lines = [f"  {'split':<11}| {'images':>7} | {'share':>6} | {'per class':>11} | {'source':<29}| used for"]
+    for r in table["rows"]:
+        lines.append(
+            f"  {r['split']:<11}| {r['images']:>7} | {r['images'] / total:>6.1%} | "
+            f"{r['per_class_min']:>5}–{r['per_class_max']:<5} | {r['source']:<29}| {r['used_for']}"
+        )
+    return lines
+
+
+def _tuning_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
+    """Settings a cached tuning result must match to be reused."""
+    return {
+        "tuning": cfg["baseline_tuning"],
+        "selection_sets": [list(s) for s in cfg["beta_selection_sets"]],
+        "val_size": cfg["val_size"],
+        "num_train": num_train,
+        "architecture": [32, 64, 128, 64],
+    }
+
+
+def tune_baseline(
+    cfg: dict[str, Any],
+    data: Sequence[torch.Tensor],
+    device: torch.device,
+    *,
+    retrain: bool = False,
+) -> dict[str, Any] | None:
+    """Grid-search the baseline's lr, batch size and epochs on validation data.
+
+    Each (lr, batch_size) is trained once for ``max_epochs`` epochs and scored
+    after every epoch, so every epoch count is a candidate. The score is the
+    same one that selects beta for the Hopfield variant: mean head_acc over
+    ``beta_selection_sets`` (clean + noisy validation, noise stream 1), so
+    both variants are tuned on the same criterion and the test set is never
+    used. Ties -> fewest epochs, then smallest lr, then smallest batch size.
+
+    The winning values are written into ``cfg`` (lr, batch_size, epochs) and
+    the result is cached as ``baseline_tuning.json``. Returns None when
+    tuning is disabled.
+    """
+    tuning = cfg["baseline_tuning"]
+    if tuning is None:
+        return None
+    sets = cfg["beta_selection_sets"]
+    path = Path(cfg["reports_dir"]) / "baseline_tuning.json"
+    first = make_splits(data, seed=tuning["seeds"][0], val_size=cfg["val_size"],
+                        train_subset=cfg["train_subset"])
+    fingerprint = _tuning_fingerprint(cfg, first.train_images.shape[0])
+
+    result: dict[str, Any] | None = None
+    if path.exists() and not retrain:
+        with open(path, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("fingerprint") == json.loads(json.dumps(fingerprint)):
+            print(f"Baseline tuning: loaded cached result {path}")
+            result = cached
+
+    if result is None:
+        scores: dict[tuple[float, int, int], list[dict[str, float]]] = {}
+        for seed in tuning["seeds"]:
+            splits = make_splits(data, seed=seed, val_size=cfg["val_size"],
+                                 train_subset=cfg["train_subset"])
+            # Clean validation is always evaluated first (reported as val_clean);
+            # the score averages only the configured selection sets.
+            val_sets = [splits.val_images] + [
+                make_corrupted_test_set(
+                    splits.val_images, seed=seed, kind=kind, level=level, stream=1
+                )
+                for kind, level in sets if kind != "clean"
+            ]
+            scored = val_sets if any(kind == "clean" for kind, _ in sets) else val_sets[1:]
+            for lr, bs in itertools.product(tuning["lr_values"], tuning["batch_size_values"]):
+                print(f"  tuning seed {seed}: lr={lr:g} batch={bs}")
+                net = build_baseline_net(seed)
+
+                def score(epoch: int, *, net: MnistNet = net, lr: float = lr, bs: int = bs,
+                          val_sets: list[torch.Tensor] = val_sets,
+                          val_labels: torch.Tensor = splits.val_labels,
+                          num_scored: int = len(scored)) -> None:
+                    accs = [
+                        (forward_images(net, images, batch_size=cfg["eval_batch_size"],
+                                        device=device)["head_pred"] == val_labels)
+                        .float().mean().item()
+                        for images in val_sets
+                    ]
+                    scored_accs = accs[len(accs) - num_scored:]
+                    scores.setdefault((lr, bs, epoch), []).append(
+                        {"val_clean": accs[0], "val_score": sum(scored_accs) / num_scored}
+                    )
+
+                train_baseline(net, splits.train_images, splits.train_labels,
+                               epochs=tuning["max_epochs"], batch_size=bs, lr=lr,
+                               seed=seed, device=device, on_epoch_end=score)
+        grid = [
+            {
+                "lr": lr, "batch_size": bs, "epochs": ep,
+                "val_clean": statistics.fmean(s["val_clean"] for s in per_seed),
+                "val_score": statistics.fmean(s["val_score"] for s in per_seed),
+            }
+            for (lr, bs, ep), per_seed in scores.items()
+        ]
+        best = min(grid, key=lambda r: (-r["val_score"], r["epochs"], r["lr"], r["batch_size"]))
+        untuned = next(
+            (r for r in grid if (r["lr"], r["batch_size"], r["epochs"])
+             == (cfg["lr"], cfg["batch_size"], cfg["epochs"])),
+            None,
+        )
+        result = {
+            "fingerprint": fingerprint,
+            "selection_sets": [list(s) for s in sets],
+            "seeds": tuning["seeds"],
+            "grid": grid,
+            "best": {k: best[k] for k in ("lr", "batch_size", "epochs")},
+            "best_scores": {k: best[k] for k in ("val_clean", "val_score")},
+            "untuned": untuned,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+
+    cfg.update(result["best"])
+    return result
+
+
+def format_tuning_table(result: dict[str, Any], *, top: int = 8) -> list[str]:
+    """Best ``top`` grid points by validation score, plus the untuned default."""
+    seeds = ",".join(str(s) for s in result["seeds"])
+    lines = [(f"  {'rank':>4} | {'lr':>7} | {'batch':>5} | {'epochs':>6} | "
+              f"{'val clean':>9} | {'val score':>9}")]
+    ranked = sorted(result["grid"], key=lambda r: (-r["val_score"], r["epochs"], r["lr"], r["batch_size"]))
+    u = result.get("untuned")
+    shown = ranked[:top] + ([u] if u is not None and u not in ranked[:top] else [])
+    for r in shown:
+        mark = "   ← previous untuned default" if r == u else ""
+        lines.append(f"  {ranked.index(r) + 1:>4} | {r['lr']:>7g} | {r['batch_size']:>5} | "
+                     f"{r['epochs']:>6} | {r['val_clean']:>9.4f} | {r['val_score']:>9.4f}{mark}")
+    b = result["best"]
+    lines.append(f"  Selected: lr={b['lr']:g}, batch={b['batch_size']}, epochs={b['epochs']} "
+                 f"({len(ranked)} grid points, tuning seeds {seeds}; val score = mean val head_acc "
+                 "over the β-selection sets)")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1617,11 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
     device = resolve_device(cfg["device"])
     print(f"Device: {device}  threads: {threads}")
     data = load_mnist(cfg["data_dir"])
+    header = ["Data splits", *format_split_table(split_table(cfg, data)), ""]
+    print("\n".join(header))
+    tuning = tune_baseline(cfg, data, device, retrain=retrain)
+    if tuning is not None:
+        header += ["Baseline tuning", *format_tuning_table(tuning), ""]
 
     per_seed: dict[str, list[list[dict[str, Any]]]] = {"clean": []}
     grids = noise_grids(cfg)
@@ -1395,7 +1633,7 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
         for kind in NOISE_TYPES:
             per_seed[kind].append([evaluate_baseline(run, kind, lvl) for lvl in grids[kind]])
 
-    lines: list[str] = []
+    lines: list[str] = list(header)
     rows: list[dict[str, Any]] = []
     for kind in ("clean", *NOISE_TYPES):
         levels = [0.0] if kind == "clean" else grids[kind]

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -340,6 +341,13 @@ def test_measure_cost_returns_positive_finite_values() -> None:
         {"beta_selection_sets": [["gaussian", 0]]},
         {"beta_selection_sets": [["blur", 0.2]]},
         {"beta_selection_sets": [["clean", 0], ["clean", 0]]},
+        {"baseline_tuning": [1]},
+        {"baseline_tuning": {"bogus": 1}},
+        {"baseline_tuning": {"lr_values": []}},
+        {"baseline_tuning": {"lr_values": [0.002, 0.001]}},
+        {"baseline_tuning": {"batch_size_values": [0]}},
+        {"baseline_tuning": {"max_epochs": 0}},
+        {"baseline_tuning": {"seeds": [0, 0]}},
     ],
 )
 def test_config_validation_rejects_bad_values(override: dict[str, Any]) -> None:
@@ -357,6 +365,9 @@ def test_config_file_and_quick_overrides_validate() -> None:
     assert quick["train_subset"] == 2000 and quick["test_subset"] == 1000
     assert quick["cost"]["batch_size"] == cfg["cost"]["batch_size"]
     assert quick["reports_dir"] != cfg["reports_dir"]
+    assert cfg["baseline_tuning"]["seeds"] == [0, 1] and cfg["baseline_tuning"]["max_epochs"] == 6
+    assert quick["baseline_tuning"]["max_epochs"] == 2
+    assert validate_mnist_config({})["baseline_tuning"] is None
 
 
 def test_config_defaults_are_the_memory_protocol() -> None:
@@ -388,6 +399,11 @@ prototypes_per_class: 3
 quick:
   seeds: [0]
   epochs: 1
+  baseline_tuning:
+    seeds: [0]
+    lr_values: [0.001, 0.003]
+    batch_size_values: [64]
+    max_epochs: 2
   val_size: 100
   train_subset: 300
   test_subset: 200
@@ -414,7 +430,8 @@ def test_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setattr(mb, "load_mnist_tensors", synthetic_mnist)
     main(["--quick", "--reports-dir", str(tmp_path)])
 
-    for name in ("summary.md", "results.csv", "results.json", "plots.png", "cost.png"):
+    for name in ("summary.md", "results.csv", "results.json", "plots.png", "cost.png",
+                 "baseline_tuning.json"):
         assert (tmp_path / name).exists(), name
     summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
     for token in ("Varied:", "Held fixed:", "Baseline", "Hopfield", "VERDICT"):
@@ -425,3 +442,10 @@ def test_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         assert f" {exp}  " in summary
     assert "memory=30 prototypes (3/class, centered)" in summary
     assert "mean of val clean + gaussian 0.4 + salt_pepper 0.15" in summary
+    # Split table is the first section; tuning (4 grid points) comes right after it.
+    assert summary.index("E0 Data splits") < summary.index("E0b Baseline tuning") < summary.index(" E1  ")
+    for split in ("train", "validation", "test"):
+        assert f"  {split} " in summary
+    tuning = json.loads((tmp_path / "baseline_tuning.json").read_text(encoding="utf-8"))
+    assert len(tuning["grid"]) == 4
+    assert all(r["val_score"] <= tuning["best_scores"]["val_score"] for r in tuning["grid"])

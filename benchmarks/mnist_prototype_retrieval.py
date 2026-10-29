@@ -51,6 +51,8 @@ from benchmarks.mnist_baseline import (
     count_buffer_values,
     count_trainable_params,
     environment_info,
+    format_split_table,
+    format_tuning_table,
     forward_embeddings,
     forward_images,
     hook_macs,
@@ -64,8 +66,10 @@ from benchmarks.mnist_baseline import (
     prepare_baseline_run,
     resolve_device,
     robust_auc,
+    split_table,
     summarize_outputs,
     time_full_evaluation,
+    tune_baseline,
 )
 from hopfieldpc import HopfieldMemory
 from hopfieldpc.api import validate_beta
@@ -540,6 +544,14 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
     data = load_mnist(cfg["data_dir"])
     betas = cfg["beta_values"]
 
+    # Stage 0: split sizes (logged first), then tune the baseline before any
+    # backbone is trained; the winning lr / batch / epochs are written into cfg.
+    splits_info = split_table(cfg, data)
+    print("Data splits\n" + "\n".join(format_split_table(splits_info)))
+    tuning = tune_baseline(cfg, data, device, retrain=retrain)
+    if tuning is not None:
+        print("Baseline tuning\n" + "\n".join(format_tuning_table(tuning)))
+
     # Stage 1: frozen baselines, memories, Hopfield nets, validation curves.
     sel_sets = cfg["beta_selection_sets"]
     configured = (cfg["prototypes_per_class"], cfg["center_prototypes"])
@@ -689,6 +701,8 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
     return {
         "config": cfg,
         "environment": env,
+        "splits": splits_info,
+        "baseline_tuning": tuning,
         "beta_star": beta_star,
         "beta_pixel": beta_pixel,
         "variant_betas": variant_betas,
@@ -1041,6 +1055,16 @@ def build_report(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     sigma = cfg["noisy_sigma"]
     sections: list[tuple[str, list[str]]] = []
     summary: dict[str, Any] = {"beta_star": bstar}
+
+    lines = [" E0  Data splits   Varied: —   Held fixed: split sizes are identical for every seed",
+             f"     {ctx}", *format_split_table(raw["splits"])]
+    sections.append(("E0 Data splits", lines))
+    if raw.get("baseline_tuning") is not None:
+        lines = [(" E0b Baseline tuning   Varied: lr, batch size, epochs   Held fixed: architecture,"
+                  " Adam, clean training, validation data only"),
+                 *format_tuning_table(raw["baseline_tuning"])]
+        sections.append(("E0b Baseline tuning", lines))
+        summary["baseline_tuning"] = raw["baseline_tuning"]["best"]
 
     e1 = res["E1"]
     lines = table_header("E1", "Clean performance: does Hopfield cost accuracy?", "model",
