@@ -34,6 +34,10 @@ beta_selection_sets: [["clean", 0], ["gaussian", 0.4], ["salt_pepper", 0.15]]
 
 # E2 / E5 grid.
 beta_values: [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+# Selection grid for --mnist-c. Wider because beta* = 100 was the top of the grid above.
+mnist_c_beta_values: [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+# Batch sizes for --mnist-c-recentering; the batch mean gets noisier as batches shrink.
+recentering_batch_sizes: [16, 64, 256, 1000]
 s1_beta: 10000.0          # S1: Hopfield at this beta must match nearest-prototype readout
 num_updates_values: [1, 2, 3, 5]   # E4
 

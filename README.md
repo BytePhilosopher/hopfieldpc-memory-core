@@ -154,6 +154,33 @@ Hopfield layer, so the gain comes from the memory design rather than from soft r
 
 Timings only compare within one run; on CPU, peak memory is an activation upper bound.
 
+### MNIST-C (unseen corruptions)
+
+```bash
+python -m benchmarks.mnist_prototype_retrieval --mnist-c            # 10 seeds, reuses cached backbones
+python -m benchmarks.mnist_prototype_retrieval --mnist-c --quick    # smoke run
+```
+
+Evaluates the same frozen networks on the 15 MNIST-C test corruptions (Mu & Gilmer 2019), with β\* selected on
+validation data only. Outputs are `mnist_c_summary.md`, `mnist_c_results.csv`, `mnist_c_results.json` and
+`mnist_c_plot.png` in the reports directory; the main experiment's files are not touched.
+
+Result (10 seeds, β\* = 100): no overall gain, with mean accuracy over the 15 corruptions at 84.59 % vs 84.72 %
+(tie, Wilcoxon p = 0.49). Hopfield wins on impulse noise, shot noise, zigzag and canny edges, and loses heavily on
+fog (−20.1 pp); the other 10 corruptions are ties after Holm correction.
+
+Test-batch recentering centers each query batch on its own mean instead of the train mean, with no new parameters
+and no retraining:
+
+```bash
+python -m benchmarks.mnist_prototype_retrieval --mnist-c-recentering
+```
+
+Result (10 seeds, batch 256): mean accuracy over the 15 corruptions rises from 84.72 % (baseline) to 90.98 %
+(+6.26 pp, better in all 10 seeds, Holm p = 0.008), fog goes from 69.65 % to 85.38 %, and uncorrupted accuracy is
+unchanged. The gain shrinks to +1.14 pp when one batch mixes corruptions and turns into a loss (−1.59 pp) in mixed
+batches of 16. This method was chosen after seeing MNIST-C results, so it still needs an independent test.
+
 ## Next Planned Tasks
 
 ```text

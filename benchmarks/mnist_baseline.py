@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
@@ -63,6 +64,21 @@ NOISE_GRID_KEYS = {
 PLACEMENTS = ("pixel", "embedding")
 DEVICES = ("auto", "cpu", "cuda")
 
+MNIST_C_URL = "https://zenodo.org/records/3239543/files/mnist_c.zip"
+MNIST_C_MD5 = "4b34b33045869ee6d424616cd3a65da3"
+MNIST_C_UNCORRUPTED_NAME = "identity"
+# Fixed before any MNIST-C result was seen, so group results cannot be picked after the fact.
+MNIST_C_CORRUPTION_GROUPS = {
+    "noise": ("shot_noise", "impulse_noise"),
+    "blur": ("glass_blur", "motion_blur"),
+    "geometric": ("shear", "scale", "rotate", "translate"),
+    "lighting_and_pattern": ("brightness", "fog", "stripe"),
+    "overlay": ("spatter", "dotted_line", "zigzag"),
+    "edge": ("canny_edges",),
+}
+DEFAULT_MNIST_C_BETA_VALUES = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+DEFAULT_RECENTERING_BATCH_SIZES = [16, 64, 256, 1000]
+
 COST_KEYS = ("batch_size", "batch_sizes", "warmup", "iters", "repeats", "num_threads")
 CONFIG_KEYS = (
     "seeds",
@@ -77,6 +93,8 @@ CONFIG_KEYS = (
     "lr",
     "eval_batch_size",
     "beta_values",
+    "mnist_c_beta_values",
+    "recentering_batch_sizes",
     "s1_beta",
     "num_updates_values",
     "gaussian_sigmas",
@@ -324,6 +342,17 @@ def validate_mnist_config(config: dict[str, Any]) -> dict[str, Any]:
 
     beta_values = validate_beta_values(config.get("beta_values", [0.5, 1, 2, 5, 10, 20, 50, 100]))
     _require_ascending("beta_values", beta_values)
+    mnist_c_beta_values = validate_beta_values(
+        config.get("mnist_c_beta_values", DEFAULT_MNIST_C_BETA_VALUES)
+    )
+    _require_ascending("mnist_c_beta_values", mnist_c_beta_values)
+    recentering_batch_sizes = config.get("recentering_batch_sizes", DEFAULT_RECENTERING_BATCH_SIZES)
+    if not isinstance(recentering_batch_sizes, list) or len(recentering_batch_sizes) == 0:
+        raise ValueError("recentering_batch_sizes must be a non-empty list of integers >= 2.")
+    recentering_batch_sizes = [
+        _require_int("recentering_batch_sizes", b, minimum=2) for b in recentering_batch_sizes
+    ]
+    _require_ascending("recentering_batch_sizes", recentering_batch_sizes)
 
     num_updates_values = config.get("num_updates_values", [1, 2, 3, 5])
     if not isinstance(num_updates_values, list) or len(num_updates_values) == 0:
@@ -370,6 +399,8 @@ def validate_mnist_config(config: dict[str, Any]) -> dict[str, Any]:
             "eval_batch_size", config.get("eval_batch_size", 1000), minimum=1
         ),
         "beta_values": beta_values,
+        "mnist_c_beta_values": mnist_c_beta_values,
+        "recentering_batch_sizes": recentering_batch_sizes,
         "s1_beta": validate_beta(config.get("s1_beta", 1e4)),
         "num_updates_values": num_updates_values,
         "gaussian_sigmas": _require_noise_grid(
@@ -523,6 +554,44 @@ def load_mnist(data_dir: str | Path) -> tuple[torch.Tensor, ...]:
     train_images, train_labels = load_mnist_tensors(data_dir, train=True)
     test_images, test_labels = load_mnist_tensors(data_dir, train=False)
     return train_images, train_labels, test_images, test_labels
+
+
+def mnist_c_corruption_names() -> list[str]:
+    """The 15 MNIST-C corruptions in group order (the uncorrupted set is not included)."""
+    return [name for names in MNIST_C_CORRUPTION_GROUPS.values() for name in names]
+
+
+def ensure_mnist_c_downloaded(data_dir: str | Path) -> None:
+    """Download and extract MNIST-C (Mu & Gilmer 2019) unless it is already in ``data_dir``."""
+    root = Path(data_dir) / "mnist_c"
+    expected = [MNIST_C_UNCORRUPTED_NAME, *mnist_c_corruption_names()]
+    if all((root / name / "test_images.npy").exists() for name in expected):
+        return
+    from torchvision.datasets.utils import download_and_extract_archive
+
+    download_and_extract_archive(
+        MNIST_C_URL, download_root=str(data_dir), md5=MNIST_C_MD5, remove_finished=True
+    )
+
+
+def load_mnist_c_test_set(
+    data_dir: str | Path,
+    corruption_name: str,
+    *,
+    test_subset: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load one MNIST-C test set; only the test split is used, never its train split.
+
+    Returns:
+        images: float tensor [N, 1, 28, 28] in [0, 1], same format as ``load_mnist_tensors``.
+        labels: long tensor [N].
+    """
+    folder = Path(data_dir) / "mnist_c" / corruption_name
+    images = torch.from_numpy(np.load(folder / "test_images.npy"))
+    labels = torch.from_numpy(np.load(folder / "test_labels.npy")).long()
+    if test_subset is not None:
+        images, labels = images[:test_subset], labels[:test_subset]
+    return images.permute(0, 3, 1, 2).float().div(255.0), labels
 
 
 def make_splits(
@@ -699,7 +768,7 @@ class ClassifierHead(nn.Module):
         return self.fc(h)
 
 
-class MnistNet(nn.Module):
+class EmbeddingClassifier(nn.Module):
     """encoder (L1-L7) -> bridge (L8) -> head (L9).
 
     The bridge maps z [B, D] to either h [B, D] (e.g. ``nn.Identity``) or a
@@ -735,17 +804,17 @@ def build_baseline_net(
     c2: int = 64,
     hidden: int = 128,
     embed_dim: int = 64,
-) -> MnistNet:
+) -> EmbeddingClassifier:
     """Build the baseline network (L8 = Identity) with seeded initialization."""
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
         encoder = MnistEncoder(c1=c1, c2=c2, hidden=hidden, embed_dim=embed_dim)
         head = ClassifierHead(embed_dim=embed_dim)
-    return MnistNet(encoder, nn.Identity(), head)
+    return EmbeddingClassifier(encoder, nn.Identity(), head)
 
 
 def train_baseline(
-    net: MnistNet,
+    net: EmbeddingClassifier,
     images: torch.Tensor,
     labels: torch.Tensor,
     *,
@@ -809,7 +878,7 @@ def get_or_train_baseline(
     device: torch.device,
     *,
     retrain: bool = False,
-) -> tuple[MnistNet, float, bool]:
+) -> tuple[EmbeddingClassifier, float, bool]:
     """Load ``backbone_seed{seed}.pt`` if it matches the config, else train and cache it.
 
     Returns ``(net, train_time_s, loaded_from_cache)``. A cached checkpoint
@@ -968,7 +1037,7 @@ def tune_baseline(
                 print(f"  tuning seed {seed}: lr={lr:g} batch={bs}")
                 net = build_baseline_net(seed)
 
-                def score(epoch: int, *, net: MnistNet = net, lr: float = lr, bs: int = bs,
+                def score(epoch: int, *, net: EmbeddingClassifier = net, lr: float = lr, bs: int = bs,
                           val_sets: list[torch.Tensor] = val_sets,
                           val_labels: torch.Tensor = splits.val_labels,
                           num_scored: int = len(scored)) -> None:
@@ -1101,7 +1170,7 @@ def _collect(
 
 @torch.inference_mode()
 def forward_embeddings(
-    net: MnistNet,
+    net: EmbeddingClassifier,
     z: torch.Tensor,
     *,
     batch_size: int,
@@ -1209,14 +1278,14 @@ def summarize_outputs(
     return metrics, {"head": head_correct, "proto": proto_correct}, confusion
 
 
-def robust_auc(levels: Sequence[float], accuracies: Sequence[float]) -> float:
+def accuracy_auc_over_severity(levels: Sequence[float], accuracies: Sequence[float]) -> float:
     """Trapezoid mean of accuracy over noise levels (clean level included).
 
     AUC = integral(acc d level) / (max level - min level), so a model that is
     perfect at every level scores 1.0 regardless of the grid spacing.
     """
     if len(levels) != len(accuracies) or len(levels) < 2:
-        raise ValueError("robust_auc needs matching level/accuracy lists of length >= 2.")
+        raise ValueError("accuracy_auc_over_severity needs matching level/accuracy lists of length >= 2.")
     area = sum(
         (levels[i + 1] - levels[i]) * (accuracies[i + 1] + accuracies[i]) / 2.0
         for i in range(len(levels) - 1)
@@ -1255,7 +1324,7 @@ def model_size_bytes(model: nn.Module) -> int:
     return len(buffer.getvalue())
 
 
-def analytical_macs(net: MnistNet) -> list[tuple[str, int]]:
+def analytical_macs(net: EmbeddingClassifier) -> list[tuple[str, int]]:
     """Per-layer multiply-accumulates for one image, from the architecture alone.
 
     conv: H_out * W_out * C_out * k^2 * C_in;  linear: in * out.
@@ -1280,7 +1349,7 @@ def analytical_macs(net: MnistNet) -> list[tuple[str, int]]:
 
 
 @torch.inference_mode()
-def hook_macs(net: MnistNet, *, batch_size: int = 2) -> int:
+def hook_macs(net: EmbeddingClassifier, *, batch_size: int = 2) -> int:
     """Per-image MACs counted from real output shapes via forward hooks.
 
     Hooks cover every Conv2d and Linear module; a bridge exposing
@@ -1489,7 +1558,7 @@ class BaselineRun:
 
     seed: int
     splits: MnistSplits
-    net: MnistNet
+    net: EmbeddingClassifier
     train_time_s: float
     from_cache: bool
     prototypes: torch.Tensor  # [K, D] embedding prototypes M
@@ -1656,7 +1725,7 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
             }})
         if kind != "clean":
             aucs = [
-                robust_auc(levels, [r["head_acc"] for r in seed_rows])
+                accuracy_auc_over_severity(levels, [r["head_acc"] for r in seed_rows])
                 for seed_rows in per_seed[kind]
             ]
             auc_mean, auc_std = mean_std(aucs)

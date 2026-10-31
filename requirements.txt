@@ -3,7 +3,7 @@
 
 # Core numerical / ML dependencies
 torch>=2.2
-numpy>=1.24
+numpy>=1.24,<2  # torch 2.2 (last release for Intel Macs) cannot use NumPy 2
 PyYAML>=6.0
 
 # Testing
