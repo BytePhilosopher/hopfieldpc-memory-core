@@ -1,0 +1,8 @@
+# Hopfield layer after L5 (Flatten) vs Baseline, with the L8 placement as a reference.
+# Seeds, splits, noise grids, memory design and frozen backbones all come from source_config,
+# so that only the placement of the layer differs. Backbones are never trained here.
+source_config: "configs/mnist_prototype_retrieval.yaml"
+reports_dir: "reports/mnist_l5_hopfield"
+quick_reports_dir: "reports/mnist_l5_hopfield_quick"
+# Both placements select beta on this wider grid, because beta* = 100 was the top of the L8 grid.
+beta_grid_key: "mnist_c_beta_values"
