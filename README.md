@@ -181,6 +181,13 @@ Result (10 seeds, batch 256): mean accuracy over the 15 corruptions rises from 8
 unchanged. The gain shrinks to +1.14 pp when one batch mixes corruptions and turns into a loss (−1.59 pp) in mixed
 batches of 16. This method was chosen after seeing MNIST-C results, so it still needs an independent test.
 
+### CIFAR-10-C (independent test, run on Colab)
+
+`benchmarks/cifar10_c_retrieval.py` tests the same method on a ResNet-18 trained on clean CIFAR-10, with the main
+result fixed in advance: Hopfield recentered vs Baseline at batch 256, mean accuracy AUC over severities 0-5 across
+the 15 standard corruptions. It needs a GPU, resumes from its output directory, and its docstring lists the Colab
+cells. No results yet.
+
 ## Next Planned Tasks
 
 ```text

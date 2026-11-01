@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+import benchmarks.cifar10_c_retrieval as cifar
 import benchmarks.mnist_baseline as mb
 import benchmarks.mnist_prototype_retrieval as mb_retrieval
 from benchmarks.mnist_baseline import (
@@ -595,3 +596,118 @@ def test_mnist_c_recentering_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatc
     assert "VERDICT" in summary and "FAIL" not in summary and "Mixed corruptions" in summary
     row_count = len((reports / "mnist_c_recentering_results.csv").read_text(encoding="utf-8").splitlines()) - 1
     assert row_count == 17 * (2 + 2 * 4)  # 15 + uncorrupted + mixed, 2 fixed readouts, 2 x 4 batch sizes
+
+
+def test_random_crop_and_flip_keeps_shape_and_uses_source_pixels() -> None:
+    torch.manual_seed(0)
+    images = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).reshape(2, 3, 8, 8)
+    out = cifar.random_crop_and_flip(images, padding=2)
+    assert out.shape == images.shape
+    assert set(out.flatten().tolist()) <= set(images.flatten().tolist())
+    # All channels of one pixel come from the same source position.
+    assert torch.equal(out[:, 1] - out[:, 0], torch.full_like(out[:, 0], 64.0))
+
+
+def test_cifar_encoder_output_shape_and_channel_order() -> None:
+    encoder = cifar.CifarResNetEncoder(base_width=2, embed_dim=8).eval()
+    assert encoder(torch.rand(4, 3, 32, 32)).shape == (4, 8)
+
+
+def test_load_cifar10_c_selects_the_requested_severity_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cifar, "IMAGES_PER_SEVERITY", 2)
+    root = tmp_path / "CIFAR-10-C"
+    root.mkdir()
+    pixels = np.zeros((10, 32, 32, 3), dtype=np.uint8)
+    for index in range(10):
+        pixels[index] = index
+    np.save(root / "fog.npy", pixels)
+    np.save(root / "labels.npy", np.arange(10) % 10)
+    images, labels = cifar.load_cifar10_c_test_set(tmp_path, "fog", 3)
+    assert images.shape == (2, 3, 32, 32)
+    assert labels.tolist() == [4, 5]
+    assert images[0, 0, 0, 0].item() == pytest.approx(4 / 255)
+    with pytest.raises(ValueError, match="severity"):
+        cifar.load_cifar10_c_test_set(tmp_path, "fog", 6)
+
+
+def test_collapse_to_severity_auc_includes_clean_as_severity_zero() -> None:
+    rows = [{"seed": 0, "test_set": "identity", "severity": 0, "readout": "baseline",
+             "batch_size": None, "head_acc": 1.0}]
+    rows += [{"seed": 0, "test_set": "fog", "severity": s, "readout": "baseline", "batch_size": None,
+              "head_acc": 1.0 - s * 0.2} for s in cifar.SEVERITIES]
+    collapsed = cifar.collapse_to_severity_auc(rows)
+    fog = next(r for r in collapsed if r["test_set"] == "fog")
+    assert fog["head_acc"] == pytest.approx(0.5)
+    assert len(collapsed) == 2
+
+
+def _tiny_cifar_data(train: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    n = 300 if train else 40
+    generator = torch.Generator().manual_seed(0 if train else 1)
+    labels = torch.arange(n) % 10
+    images = torch.rand(n, 3, 32, 32, generator=generator) * 0.2
+    for c in range(10):
+        images[labels == c, :, c * 3 : c * 3 + 2] += 0.7
+    return images.clamp(0, 1).mul(255).round().to(torch.uint8).float().div(255), labels
+
+
+def test_cifar10_c_end_to_end_resumes_without_rework(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cifar, "IMAGES_PER_SEVERITY", 40)
+    train_images, train_labels = _tiny_cifar_data(True)
+    test_images, test_labels = _tiny_cifar_data(False)
+    monkeypatch.setattr(cifar, "load_cifar10", lambda _: (train_images, train_labels, test_images, test_labels))
+    root = tmp_path / "data" / "CIFAR-10-C"
+    root.mkdir(parents=True)
+    pixels = test_images.mul(255).round().to(torch.uint8).permute(0, 2, 3, 1).numpy()
+    for name in cifar.CORRUPTION_NAMES:
+        np.save(root / f"{name}.npy", np.concatenate([pixels] * 5))
+    np.save(root / "labels.npy", np.concatenate([test_labels.numpy()] * 5))
+
+    cfg = cifar.Cifar10CConfig(
+        data_dir=str(tmp_path / "data"), output_dir=str(tmp_path / "out"), seeds=[0], base_width=2,
+        embed_dim=8, epochs=1, batch_size=32, val_size=50, min_clean_val_accuracy=0.0,
+        prototypes_per_class=2, beta_values=[1.0, 100.0], eval_batch_size=64,
+    )
+    raw, text = cifar.run_experiment(cfg)
+    for name in ("cifar10_c_summary.md", "cifar10_c_results.csv", "cifar10_c_results.json", "cifar10_c_plot.png",
+                 "backbone_seed0.pt", "validation_seed0.json", "results_seed0.json"):
+        assert (tmp_path / "out" / name).exists(), name
+    assert "CIFAR-10-C" in text and "VERDICT" in text and "FAIL" not in text
+    assert "accuracy AUC over severity" in text and "Soft vs hard retrieval" in text
+    assert raw["num_cached_backbones"] == 0
+
+    # A rerun after a disconnect must not train or evaluate again.
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("work was repeated on resume")
+
+    monkeypatch.setattr(cifar, "train_backbone", fail)
+    monkeypatch.setattr(cifar, "prepare_seed_run", fail)
+    _, resumed = cifar.run_experiment(cfg)
+    assert resumed == text
+
+
+def test_cifar10_c_stops_before_test_data_when_validation_accuracy_is_low(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    train_images, train_labels = _tiny_cifar_data(True)
+    test_images, test_labels = _tiny_cifar_data(False)
+    monkeypatch.setattr(cifar, "load_cifar10", lambda _: (train_images, train_labels, test_images, test_labels))
+    def fail_download(_: Any) -> None:
+        raise AssertionError("corrupted data was requested")
+
+    monkeypatch.setattr(cifar, "ensure_cifar10_c_downloaded", fail_download)
+    cfg = cifar.Cifar10CConfig(
+        data_dir=str(tmp_path), output_dir=str(tmp_path / "out"), seeds=[0], base_width=2, embed_dim=8,
+        epochs=1, batch_size=32, val_size=50, min_clean_val_accuracy=1.01, prototypes_per_class=2,
+        beta_values=[1.0], eval_batch_size=64,
+    )
+    with pytest.raises(SystemExit, match="below"):
+        cifar.run_experiment(cfg)
+
+
+def test_cifar10_c_refuses_to_run_without_a_gpu_unless_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(SystemExit, match="No GPU"):
+        cifar.main(["--quick"])

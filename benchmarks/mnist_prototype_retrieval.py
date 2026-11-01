@@ -2169,7 +2169,12 @@ def summarize_recentering(
     }
 
 
-def format_recentering_report(raw: dict[str, Any]) -> str:
+def format_recentering_report(
+    raw: dict[str, Any],
+    *,
+    dataset_name: str = "MNIST-C",
+    metric: str = "head_acc",
+) -> str:
     """Render the recentering tables, the sanity report and the verdict."""
     summary = raw["summary"]
     n_seeds = len(raw["config"]["seeds"])
@@ -2195,17 +2200,17 @@ def format_recentering_report(raw: dict[str, Any]) -> str:
 
     lines: list[str] = []
     tables = (
-        ("mean_over_corruptions", "Mean head_acc over the 15 corruptions (each batch holds one corruption)"),
+        ("mean_over_corruptions", f"Mean {metric} over the 15 corruptions (each batch holds one corruption)"),
         ("mixed_corruptions", "Mixed corruptions (each image has a random corruption)"),
         ("uncorrupted", "Uncorrupted MNIST test set (the price of recentering)"),
     )
     for key, title in tables:
-        lines += [*table_header("MNIST-C", title, "batch size", held, context), *table_columns("batch", 6)]
+        lines += [*table_header(dataset_name, title, "batch size", held, context), *table_columns("batch", 6)]
         lines += [f"  {item['batch_size']:>6} │ {comparison_cells(item)}" for item in summary[key]]
         lines.append("")
 
     lines += table_header(
-        "MNIST-C", f"Per corruption at batch size {summary['detail_batch_size']}", "corruption", held,
+        dataset_name, f"Per corruption at batch size {summary['detail_batch_size']}", "corruption", held,
         "HR = Hopfield recentered, B = Baseline, BR = Baseline recentered; Holm across 15 corruptions",
     )
     lines += table_columns("Corruption", 14)
@@ -2227,8 +2232,8 @@ def format_recentering_report(raw: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def plot_recentering(raw: dict[str, Any], path: Path) -> bool:
-    """mnist_c_recentering_plot.png: accuracy vs batch size for the three test conditions."""
+def plot_recentering(raw: dict[str, Any], path: Path, *, metric: str = "head_acc") -> bool:
+    """Accuracy vs batch size for the three test conditions (mixed and uncorrupted stay head_acc)."""
     plt = _import_pyplot()
     if plt is None:
         return False
@@ -2250,7 +2255,7 @@ def plot_recentering(raw: dict[str, Any], path: Path) -> bool:
         ax.set_xticks(xs)
         ax.set_xticklabels([str(x) for x in xs])
         ax.minorticks_off()
-        _style(ax, title, "batch size (log scale)", "head_acc")
+        _style(ax, title, "batch size (log scale)", metric if key == "mean_over_corruptions" else "head_acc")
     axes[0].legend(frameon=False, fontsize=9, handlelength=4)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
