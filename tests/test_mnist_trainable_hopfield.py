@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import benchmarks.mnist.hopfield_trainable as th
-import benchmarks.mnist.tuning as tuning
+import benchmarks.mnist.tuning_trainable as tuning_trainable
 from benchmarks.common import tuned_params
 from benchmarks.mnist.hopfield_l5 import L5_SECTION, l5_fingerprint
 from benchmarks.mnist.baseline import (
@@ -130,7 +130,7 @@ def test_end_to_end_resumes_and_leaves_backbones_alone(tmp_path: Path, monkeypat
     num_train = make_splits(data, seed=0, val_size=cfg["val_size"], train_subset=None).train_images.shape[0]
     tuned_params.save_entry(cfg["tuned_params"], "quick", L5_SECTION, l5_fingerprint(cfg, num_train),
                             {"beta_l5": 10.0, "beta_l8": 10.0})
-    best = tuning.tune_hopfield_trainable(cfg, data, torch.device("cpu"))["best"]
+    best = tuning_trainable.tune_hopfield_trainable(cfg, data, torch.device("cpu"))["best"]
 
     raw = th.run_experiment(cfg, output)
     assert raw["tuning"]["best"] == best

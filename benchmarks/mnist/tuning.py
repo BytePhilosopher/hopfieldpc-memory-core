@@ -8,7 +8,6 @@ validation data only (never test data) and written to
     hopfield_l8         beta*, pixel beta, variant betas -> benchmarks.mnist.hopfield
     hopfield_mnist_c    beta* on the wider grid          -> benchmarks.mnist.hopfield_mnist_c / _recentering
     hopfield_l5         beta of both placements          -> benchmarks.mnist.hopfield_l5
-    hopfield_trainable  memory lr, initial beta          -> benchmarks.mnist.hopfield_trainable
 
 A section whose stored fingerprint matches the current settings is skipped, so
 running this again does nothing unless a relevant setting changed (or
@@ -24,7 +23,6 @@ and cached in the reports directory, exactly as the experiments do.
 from __future__ import annotations
 
 import argparse
-import copy
 import gc
 import itertools
 import statistics
@@ -75,20 +73,10 @@ from benchmarks.mnist.hopfield_l5 import (
     validation_curve,
 )
 from benchmarks.mnist.hopfield_mnist_c import MNIST_C_SECTION, mnist_c_fingerprint
-from benchmarks.mnist.hopfield_trainable import DEFAULT_CONFIG_PATH as TRAINABLE_CONFIG_PATH
-from benchmarks.mnist.hopfield_trainable import (
-    TRAINABLE_SECTION,
-    apply_fixed_betas,
-    load_trainable_config,
-    make_memory_net,
-    train_stage,
-    trainable_fingerprint,
-    validation_sets,
-)
 
-# In dependency order: beta selection needs the tuned backbone, and the trainable
-# memory starts from the stored L5 / L8 betas.
-SECTIONS = (BASELINE_SECTION, L8_SECTION, MNIST_C_SECTION, L5_SECTION, TRAINABLE_SECTION)
+# In dependency order: beta selection needs the tuned backbone. The trainable
+# memory (a separate layer change) is tuned by benchmarks.mnist.tuning_trainable.
+SECTIONS = (BASELINE_SECTION, L8_SECTION, MNIST_C_SECTION, L5_SECTION)
 
 
 def _tuned_or_run(
@@ -310,46 +298,6 @@ def tune_hopfield_l5(
     )
 
 
-def tune_hopfield_trainable(
-    cfg: dict[str, Any], data: Sequence[torch.Tensor], device: torch.device, *, force: bool = False
-) -> dict[str, Any]:
-    """Memory lr and initial beta per placement for the trainable memory, on one seed's validation data."""
-    apply_fixed_betas(cfg, data)
-    tuning = cfg["tuning"]
-
-    def search() -> dict[str, Any]:
-        run = prepare_baseline_run(cfg, data, tuning["seed"], device)
-        val = validation_sets(cfg, run)
-        train_features = encode_features(
-            run.net.encoder, run.splits.train_images, batch_size=run.batch_size, device=device
-        )
-        limit = tuning["train_images"]
-        result: dict[str, Any] = {"grid": {}, "best": {}}
-        for placement, inputs, beta in (("l5", train_features, cfg["beta_l5"]), ("l8", run.z_train, cfg["beta_l8"])):
-            start = make_memory_net(run, placement, inputs, cfg, beta=beta)
-            grid = []
-            for lr, factor in itertools.product(tuning["memory_lr_values"], tuning["beta_factors"]):
-                net = copy.deepcopy(start)
-                net.bridge.log_beta.data = torch.tensor(float(beta * factor)).log().to(device)
-                stage = train_stage(net, run.splits.train_images[:limit], run.splits.train_labels[:limit], val, cfg,
-                                    epochs=tuning["epochs"], memory_lr=lr, finetune=False, seed=tuning["seed"],
-                                    device=device)
-                grid.append({"memory_lr": lr, "beta_factor": factor, "initial_beta": beta * factor,
-                             "val": stage["best_val"]})
-                print(f"  tuning {placement}: lr {lr:g}, beta {beta * factor:g}: val {stage['best_val']:.4f}",
-                      flush=True)
-            result["grid"][placement] = grid
-            result["best"][placement] = max(grid, key=lambda g: g["val"])
-        return result
-
-    return _tuned_or_run(
-        cfg, TRAINABLE_SECTION, trainable_fingerprint(cfg, train_size(cfg, data)), search, force=force,
-        describe=lambda v: "; ".join(
-            f"{p}: memory lr {b['memory_lr']:g}, initial beta {b['initial_beta']:g}" for p, b in v["best"].items()
-        ),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -360,7 +308,6 @@ def run_tuning(
     *,
     config: Path = DEFAULT_CONFIG_PATH,
     l5_config: Path = L5_CONFIG_PATH,
-    trainable_config: Path = TRAINABLE_CONFIG_PATH,
     quick: bool = False,
     force: bool = False,
     data_dir: str | None = None,
@@ -399,10 +346,6 @@ def run_tuning(
         l5_cfg = derived(load_l5_config(l5_config, quick=quick)[0])
         apply_baseline_params(l5_cfg, data)
         results[L5_SECTION] = tune_hopfield_l5(l5_cfg, data, device, force=force)
-    if TRAINABLE_SECTION in sections:
-        trainable_cfg = derived(load_trainable_config(trainable_config, quick=quick)[0])
-        apply_baseline_params(trainable_cfg, data)
-        results[TRAINABLE_SECTION] = tune_hopfield_trainable(trainable_cfg, data, device, force=force)
     return results
 
 
@@ -414,14 +357,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--quick", action="store_true", help="Smoke settings, stored under the 'quick' profile.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--l5-config", type=Path, default=L5_CONFIG_PATH)
-    parser.add_argument("--trainable-config", type=Path, default=TRAINABLE_CONFIG_PATH)
     parser.add_argument("--data-dir", type=str, default=None, help="MNIST download/cache dir.")
     parser.add_argument("--reports-dir", type=str, default=None, help="Where backbones are cached.")
     parser.add_argument("--tuned-params", type=str, default=None, help="Tuned-parameter file to read and write.")
     args = parser.parse_args(argv)
     run_tuning(
-        [s for s in SECTIONS if s in args.only], config=args.config, l5_config=args.l5_config,
-        trainable_config=args.trainable_config, quick=args.quick, force=args.force, data_dir=args.data_dir,
+        [s for s in SECTIONS if s in args.only], config=args.config, l5_config=args.l5_config, quick=args.quick, force=args.force, data_dir=args.data_dir,
         reports_dir=args.reports_dir, tuned_params_path=args.tuned_params,
     )
 

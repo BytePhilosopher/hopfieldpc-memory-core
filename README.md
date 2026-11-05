@@ -115,7 +115,8 @@ experiments only read that file, so tuning runs once per dataset and settings.
 ```text
 benchmarks/
   common/       tuned_params.py (tuned-parameter store), validation.py
-  mnist/        tuning.py → tuned_params.json
+  mnist/        tuning.py → tuned_params.json      (baseline, L8, MNIST-C, L5)
+                tuning_trainable.py → tuned_params.json   (trainable memory only)
                 baseline.py               CNN, L8 = Identity (shared data, training, metrics)
                 hopfield.py               Hopfield at L8, frozen memory (E1–E9)
                 hopfield_mnist_c.py       the L8 networks on MNIST-C
@@ -139,7 +140,7 @@ MNIST `tuning.py` tunes these sections, in dependency order, all on validation d
 | `hopfield_l8`        | β\*, pixel-placement β, memory-variant βs     | `hopfield.py`                                      |
 | `hopfield_mnist_c`   | β\* on the wider MNIST-C grid                 | `hopfield_mnist_c.py`, `hopfield_recentering.py`   |
 | `hopfield_l5`        | β of Hopfield@L5 (every memory variant) and @L8 | `hopfield_l5.py`, `hopfield_trainable.py`        |
-| `hopfield_trainable` | memory lr, initial β per placement            | `hopfield_trainable.py`                            |
+| `hopfield_trainable` | memory lr, initial β per placement (`tuning_trainable.py`) | `hopfield_trainable.py`               |
 
 ```bash
 python -m benchmarks.mnist.tuning                      # skips every section that is already tuned
@@ -196,11 +197,26 @@ Settings are in `configs/mnist/hopfield.yaml`. Outputs go to
 - `plots.png` (accuracy vs noise, β, T and retrieval confusion) and `cost.png` (latency and
   throughput vs batch, accuracy vs latency).
 
-Result (10 seeds, β\* = 100): clean accuracy is unchanged (98.86 % vs 98.89 %, tie), while
-robustness AUC rises by +7.2 pp under Gaussian noise and +7.8 pp under salt-and-pepper noise,
-better in all 10 seeds (Wilcoxon p = 0.002). Occlusion shows no significant effect. The layer adds
-0 trainable parameters and +0.24 % MACs. A hard nearest-centered-prototype readout matches the
-Hopfield layer, so the gain comes from the memory design rather than from soft retrieval.
+Result (10 seeds, tuned baseline, β\* = 100): clean accuracy is unchanged (98.62 % vs 98.66 %,
+tie), while robustness AUC rises by +5.55 pp under Gaussian noise and +5.35 pp under
+salt-and-pepper noise, better in all 10 seeds (Wilcoxon p = 0.002). Occlusion shows no significant
+effect (+0.41 pp). The layer adds 0 trainable parameters and +0.24 % MACs. A hard
+nearest-centered-prototype readout matches the Hopfield layer, so the gain comes from the memory
+design rather than from soft retrieval.
+
+### Placement: Hopfield after L5 vs at L8
+
+```bash
+python -m benchmarks.mnist.hopfield_l5            # 10 seeds, reuses the cached backbones
+python -m benchmarks.mnist.hopfield_l5 --quick    # smoke run
+```
+
+The same frozen memory (8 centered k-means prototypes per class) is placed on the 3136-d flatten
+features (L5, β = 50) instead of the 64-d embedding (L8, β = 100), with identical frozen weights.
+Result (10 seeds): Gaussian AUC +14.53 pp and salt-and-pepper AUC +15.11 pp over the baseline
+(Holm p = 0.004), against +5.55 / +5.35 pp at L8. The cost is −2.48 pp clean accuracy, +11.9 % MACs
+and about +30 % latency. The full report, with architecture, protocol, every table and the verdict,
+is in [docs/mnist_hopfield_placement_noise_report.md](docs/mnist_hopfield_placement_noise_report.md).
 
 Timings only compare within one run; on CPU, peak memory is an activation upper bound.
 

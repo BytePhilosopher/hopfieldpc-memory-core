@@ -6,12 +6,14 @@ data only. Success test, fixed before running: trainable_l5 vs baseline_aug must
 be within 0.5 pp on clean accuracy and significantly better on Gaussian and
 salt-and-pepper AUC (Wilcoxon across seeds, Holm-corrected over the two).
 
-The fixed betas, and the memory lr / initial beta per placement, are read from
-``benchmarks/mnist/tuned_params.json`` (written once by ``benchmarks.mnist.tuning``).
+The fixed betas (``benchmarks.mnist.tuning``) and the memory lr / initial beta
+per placement (``benchmarks.mnist.tuning_trainable``) are read from
+``benchmarks/mnist/tuned_params.json``; each is tuned once.
 
 Run from the repository root. Finished seeds are kept, so a stopped run resumes:
 
-    python -m benchmarks.mnist.tuning                      # once
+    python -m benchmarks.mnist.tuning                        # once: baseline, L8, MNIST-C, L5
+    python -m benchmarks.mnist.tuning_trainable              # once: trainable memory
     python -m benchmarks.mnist.hopfield_trainable            # 10 seeds
     python -m benchmarks.mnist.hopfield_trainable --quick    # smoke run
 """
@@ -390,7 +392,8 @@ def trainable_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]
 
 def hopfield_trainable_params(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any]:
     """Stored memory lr and initial beta per placement (``best``) and the grid behind them."""
-    return require_tuned(cfg, TRAINABLE_SECTION, trainable_fingerprint(cfg, train_size(cfg, data)))
+    return require_tuned(cfg, TRAINABLE_SECTION, trainable_fingerprint(cfg, train_size(cfg, data)),
+                         module="benchmarks.mnist.tuning_trainable")
 
 
 # ---------------------------------------------------------------------------

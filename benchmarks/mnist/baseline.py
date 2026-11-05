@@ -1003,9 +1003,9 @@ def train_size(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> int:
     return int(splits.train_images.shape[0])
 
 
-def tuning_command(cfg: dict[str, Any]) -> str:
+def tuning_command(cfg: dict[str, Any], module: str = "benchmarks.mnist.tuning") -> str:
     """The command that produces the tuned parameters this config needs."""
-    parts = ["python -m benchmarks.mnist.tuning"]
+    parts = [f"python -m {module}"]
     if cfg.get("quick"):
         parts.append("--quick")
     if Path(cfg["tuned_params"]).resolve() != TUNED_PARAMS_PATH.resolve():
@@ -1013,11 +1013,20 @@ def tuning_command(cfg: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def require_tuned(cfg: dict[str, Any], section: str, fingerprint: dict[str, Any]) -> dict[str, Any]:
-    """Tuned values of ``section``, read from ``cfg['tuned_params']``; never tunes."""
+def require_tuned(
+    cfg: dict[str, Any],
+    section: str,
+    fingerprint: dict[str, Any],
+    *,
+    module: str = "benchmarks.mnist.tuning",
+) -> dict[str, Any]:
+    """Tuned values of ``section``, read from ``cfg['tuned_params']``; never tunes.
+
+    ``module`` is the tuning entry point that writes this section (named in the error).
+    """
     return tuned_params.require(
         cfg["tuned_params"], tuned_params.profile_name(bool(cfg.get("quick"))), section, fingerprint,
-        tuning_command=tuning_command(cfg),
+        tuning_command=tuning_command(cfg, module),
     )
 
 
