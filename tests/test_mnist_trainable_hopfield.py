@@ -8,13 +8,16 @@ from typing import Any
 import pytest
 import torch
 
-import benchmarks.mnist_trainable_hopfield as th
-from benchmarks.mnist_baseline import (
+import benchmarks.mnist.hopfield_trainable as th
+import benchmarks.mnist.tuning as tuning
+from benchmarks.common import tuned_params
+from benchmarks.mnist.hopfield_l5 import L5_SECTION, l5_fingerprint
+from benchmarks.mnist.baseline import (
     build_baseline_net,
     checkpoint_fingerprint,
     make_splits,
 )
-from benchmarks.mnist_prototype_retrieval import HopfieldRetrievalLayer
+from benchmarks.mnist.hopfield import HopfieldRetrievalLayer
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -27,11 +30,11 @@ def synthetic_data() -> tuple[torch.Tensor, ...]:
 
 
 def tiny_config(reports_dir: Path) -> dict[str, Any]:
-    cfg, _ = th.load_trainable_config(REPO / "configs" / "mnist_trainable_hopfield.yaml", quick=True)
+    cfg, _ = th.load_trainable_config(REPO / "configs" / "mnist" / "hopfield_trainable.yaml", quick=True)
     cfg.update(
         reports_dir=str(reports_dir), seeds=[0], baseline_tuning=None, val_size=50, train_subset=None, test_subset=None,
         epochs=1, batch_size=32, lr=0.001, eval_batch_size=64, gaussian_sigmas=[0.0, 0.5], salt_pepper_probs=[0.0, 0.1],
-        occlusion_sizes=[0, 7], device="cpu", beta_l5=10.0, beta_l8=10.0, prior_rows={},
+        occlusion_sizes=[0, 7], device="cpu", prior_rows={}, tuned_params=str(reports_dir / "tuned_params.json"),
     )
     cfg["tuning"] = {"seed": 0, "train_images": 100, "epochs": 1, "memory_lr_values": [0.001], "beta_factors": [1.0]}
     cfg["cost_settings"] = {"batch_size": 2, "repeats": 1, "warmup": 1, "iters": 1}
@@ -123,12 +126,18 @@ def test_end_to_end_resumes_and_leaves_backbones_alone(tmp_path: Path, monkeypat
     saved = (backbones / "backbone_seed0.pt").read_bytes()
     monkeypatch.setattr(th, "load_mnist", lambda _: data)
     output = tmp_path / "output"
+    # The fixed betas come from the stored L5 tuning; store them directly to keep the test small.
+    num_train = make_splits(data, seed=0, val_size=cfg["val_size"], train_subset=None).train_images.shape[0]
+    tuned_params.save_entry(cfg["tuned_params"], "quick", L5_SECTION, l5_fingerprint(cfg, num_train),
+                            {"beta_l5": 10.0, "beta_l8": 10.0})
+    best = tuning.tune_hopfield_trainable(cfg, data, torch.device("cpu"))["best"]
 
     raw = th.run_experiment(cfg, output)
+    assert raw["tuning"]["best"] == best
     text, summary = th.build_report(raw)
     th.save_reports(raw, text, summary, output)
     assert (backbones / "backbone_seed0.pt").read_bytes() == saved
-    assert {"summary.md", "results.csv", "results.json", "seeds", "memory_tuning.json"} <= {p.name for p in output.iterdir()}
+    assert {"summary.md", "results.csv", "results.json", "seeds"} <= {p.name for p in output.iterdir()}
     assert set(raw["seeds"][0]["rows"]["noise_gaussian"][0]["metrics"]) == set(th.MODELS)
     assert raw["seeds"][0]["sanity"]["convs_frozen"]
 

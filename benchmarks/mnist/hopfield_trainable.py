@@ -1,25 +1,19 @@
 """MNIST: trainable Hopfield memory after L5, with a trainable L8 control.
 
-Every model starts from the same frozen clean backbone per seed:
-
-    baseline             clean backbone, not trained further
-    baseline_aug         L6-L9 fine-tuned on noisy batches
-    baseline_aug_full    L1-L9 fine-tuned on noisy batches (a stronger reference)
-    fixed_l5             k-means memory after L5, not trained
-    trainable_l5_a       Stage A: memory and beta trained, every other layer frozen
-    trainable_l5         Stage B: then memory, beta and L6-L9 trained together
-    trainable_l5_snapped each trained prototype replaced by its nearest real training feature
-    trainable_l8         the same two stages with the memory at L8
 
 The best epoch of each stage, including "no training", is chosen on validation
 data only. Success test, fixed before running: trainable_l5 vs baseline_aug must
 be within 0.5 pp on clean accuracy and significantly better on Gaussian and
 salt-and-pepper AUC (Wilcoxon across seeds, Holm-corrected over the two).
 
+The fixed betas, and the memory lr / initial beta per placement, are read from
+``benchmarks/mnist/tuned_params.json`` (written once by ``benchmarks.mnist.tuning``).
+
 Run from the repository root. Finished seeds are kept, so a stopped run resumes:
 
-    python -m benchmarks.mnist_trainable_hopfield            # 10 seeds
-    python -m benchmarks.mnist_trainable_hopfield --quick    # smoke run
+    python -m benchmarks.mnist.tuning                      # once
+    python -m benchmarks.mnist.hopfield_trainable            # 10 seeds
+    python -m benchmarks.mnist.hopfield_trainable --quick    # smoke run
 """
 
 from __future__ import annotations
@@ -28,7 +22,6 @@ import argparse
 import copy
 import csv
 import gc
-import itertools
 import json
 import time
 from collections.abc import Sequence
@@ -40,12 +33,13 @@ import torch.nn.functional as F
 import yaml
 from torch import nn
 
-from benchmarks.mnist_baseline import (
+from benchmarks.mnist.baseline import (
     NOISE_TYPES,
     BaselineRun,
     MnistEncoder,
     accuracy_auc_over_severity,
     analytical_macs,
+    apply_baseline_params,
     configure_threads,
     copy_net,
     corrupt_images,
@@ -58,15 +52,17 @@ from benchmarks.mnist_baseline import (
     model_size_bytes,
     noise_grids,
     prepare_baseline_run,
+    require_tuned,
     resolve_device,
     summarize_outputs,
+    train_size,
 )
-from benchmarks.mnist_l5_hopfield import (
+from benchmarks.mnist.hopfield_l5 import (
     _p,
     _pct,
     _pp,
     _table,
-    apply_cached_tuning,
+    hopfield_l5_params,
     compare,
     embed_features,
     encode_features,
@@ -75,17 +71,18 @@ from benchmarks.mnist_l5_hopfield import (
     test_images_for,
     values_in_order,
 )
-from benchmarks.mnist_prototype_retrieval import (
+from benchmarks.mnist.hopfield import (
     ALPHA,
     WINNER_DELTA,
     _import_pyplot,
     _style,
     build_prototype_memory,
+    memory_fingerprint,
     holm_adjusted_p_values,
     mcnemar_test,
 )
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "mnist_trainable_hopfield.yaml"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "mnist" / "hopfield_trainable.yaml"
 
 MODELS = (
     "baseline",
@@ -371,39 +368,29 @@ def make_memory_net(
     return PlacedNet(copy_net(run.net.encoder), copy_net(run.net.head), layer, placement).eval()
 
 
-def tune_memory(cfg: dict[str, Any], data: Sequence[torch.Tensor], device: torch.device, output: Path) -> dict[str, Any]:
-    """Choose the memory lr and initial beta per placement, on validation data only; cached."""
-    path = output / "memory_tuning.json"
-    fingerprint = {k: cfg[k] for k in ("tuning", "beta_l5", "beta_l8", "train_gaussian_sigmas", "train_salt_pepper_probs",
-                                       "cluster_weight", "separation_weight", "beta_lr")}
-    if path.exists():
-        with open(path, encoding="utf-8") as f:
-            cached = json.load(f)
-        if cached["fingerprint"] == fingerprint:
-            print(f"Memory tuning: loaded cached result {path}", flush=True)
-            return cached
-    tuning = cfg["tuning"]
-    run = prepare_baseline_run(cfg, data, tuning["seed"], device)
-    val = validation_sets(cfg, run)
-    train_features = encode_features(run.net.encoder, run.splits.train_images, batch_size=run.batch_size, device=device)
-    limit = tuning["train_images"]
-    result: dict[str, Any] = {"fingerprint": fingerprint, "grid": {}, "best": {}}
-    for placement, inputs, beta in (("l5", train_features, cfg["beta_l5"]), ("l8", run.z_train, cfg["beta_l8"])):
-        start = make_memory_net(run, placement, inputs, cfg, beta=beta)
-        grid = []
-        for lr, factor in itertools.product(tuning["memory_lr_values"], tuning["beta_factors"]):
-            net = copy.deepcopy(start)
-            net.bridge.log_beta.data = torch.tensor(float(beta * factor)).log().to(device)
-            stage = train_stage(net, run.splits.train_images[:limit], run.splits.train_labels[:limit], val, cfg,
-                                epochs=tuning["epochs"], memory_lr=lr, finetune=False, seed=tuning["seed"], device=device)
-            grid.append({"memory_lr": lr, "beta_factor": factor, "initial_beta": beta * factor, "val": stage["best_val"]})
-            print(f"  tuning {placement}: lr {lr:g}, beta {beta * factor:g}: val {stage['best_val']:.4f}", flush=True)
-        result["grid"][placement] = grid
-        result["best"][placement] = max(grid, key=lambda g: g["val"])
-    output.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-    return result
+TRAINABLE_SECTION = "hopfield_trainable"
+# Settings the memory tuning (memory lr, initial beta per placement) depends on.
+TRAINABLE_TUNING_KEYS = ("tuning", "beta_l5", "beta_l8", "train_gaussian_sigmas", "train_salt_pepper_probs",
+                         "cluster_weight", "separation_weight", "beta_lr", "center_ema", "prototypes_per_class")
+
+
+def apply_fixed_betas(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> None:
+    """Write the stored validation-selected betas of the fixed L5 / L8 memories into ``cfg``."""
+    tuned = hopfield_l5_params(cfg, data)
+    cfg["beta_l5"], cfg["beta_l8"] = tuned["beta_l5"], tuned["beta_l8"]
+
+
+def trainable_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
+    return {
+        "backbone": memory_fingerprint(cfg, num_train, [])["backbone"],
+        "selection_sets": [list(s) for s in cfg["beta_selection_sets"]],
+        **{k: cfg[k] for k in TRAINABLE_TUNING_KEYS},
+    }
+
+
+def hopfield_trainable_params(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any]:
+    """Stored memory lr and initial beta per placement (``best``) and the grid behind them."""
+    return require_tuned(cfg, TRAINABLE_SECTION, trainable_fingerprint(cfg, train_size(cfg, data)))
 
 
 # ---------------------------------------------------------------------------
@@ -570,11 +557,13 @@ def run_experiment(cfg: dict[str, Any], output: Path) -> dict[str, Any]:
     env = environment_info(device)
     print(f"Device: {device}  threads: {threads}  torch {torch.__version__}", flush=True)
     data = load_mnist(cfg["data_dir"])
-    apply_cached_tuning(cfg)
+    apply_baseline_params(cfg, data)
+    apply_fixed_betas(cfg, data)
+    tuning = hopfield_trainable_params(cfg, data)
     for seed in cfg["seeds"]:
         require_cached_backbone(cfg, data, seed)
-    tuning = tune_memory(cfg, data, device, output)
-    print(f"Chosen settings: {tuning['best']}", flush=True)
+    print(f"Fixed betas: L5 = {cfg['beta_l5']:g}, L8 = {cfg['beta_l8']:g}; stored memory settings: {tuning['best']}",
+          flush=True)
 
     seeds_dir = output / "seeds"
     seeds_dir.mkdir(parents=True, exist_ok=True)
@@ -854,10 +843,11 @@ def plot_comparison(raw: dict[str, Any], path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def load_prior_rows(path: Path) -> tuple[float, float, dict[int, dict[float, dict[str, float]]]]:
-    """Fixed betas and the L5 experiment's Gaussian accuracies per seed, to check they repeat."""
+def load_prior_rows(path: Path) -> dict[int, dict[float, dict[str, float]]]:
+    """The L5 experiment's Gaussian accuracies per seed, to check that they repeat (empty if not run)."""
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found; run benchmarks.mnist_l5_hopfield first.")
+        print(f"Note: {path} not found; the repeat check against the L5 experiment is skipped.", flush=True)
+        return {}
     with open(path, encoding="utf-8") as f:
         prior = json.load(f)
     rows: dict[int, dict[float, dict[str, float]]] = {}
@@ -866,22 +856,32 @@ def load_prior_rows(path: Path) -> tuple[float, float, dict[int, dict[float, dic
             "baseline": row["metrics"]["baseline"]["head_acc"],
             "hopfield_l5": row["metrics"]["hopfield_l5"]["head_acc"],
         }
-    return prior["beta_l5"], prior["beta_l8"], rows
+    return rows
 
 
-def load_trainable_config(path: Path, *, quick: bool = False, seed: int | None = None, reports_dir: str | None = None) -> tuple[dict[str, Any], Path]:
+def load_trainable_config(
+    path: Path,
+    *,
+    quick: bool = False,
+    seed: int | None = None,
+    reports_dir: str | None = None,
+    tuned_params_path: str | None = None,
+) -> tuple[dict[str, Any], Path]:
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     overrides = raw.pop("quick", {}) if isinstance(raw.get("quick"), dict) else {}
     if quick:
         raw.update(overrides)
-    cfg = load_config(Path(raw["source_config"]), quick=quick, seed=seed)
+    cfg = load_config(Path(raw["source_config"]), quick=quick, seed=seed, tuned_params_path=tuned_params_path)
     output = Path(reports_dir or raw["reports_dir"])
     cfg["cost_settings"] = raw["cost"]
     for key in ("train_gaussian_sigmas", "train_salt_pepper_probs", "memory_epochs", "finetune_epochs", "backbone_lr",
                 "beta_lr", "cluster_weight", "separation_weight", "center_ema", "tuning"):
         cfg[key] = raw[key]
-    cfg["beta_l5"], cfg["beta_l8"], cfg["prior_rows"] = load_prior_rows(Path(raw["fixed_results"]))
+    # The fixed betas are the L5 experiment's stored ones, so its beta grid is part of their fingerprint.
+    with open(raw["l5_config"], encoding="utf-8") as f:
+        cfg["l5_betas"] = list(cfg[yaml.safe_load(f)["beta_grid_key"]])
+    cfg["prior_rows"] = load_prior_rows(Path(raw["fixed_results"]))
     return cfg, output
 
 
@@ -891,9 +891,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--quick", action="store_true", help="1 seed, 1 epoch per stage; separate output folder.")
     parser.add_argument("--seed", type=int, default=None, help="Run a single seed.")
     parser.add_argument("--reports-dir", type=str, default=None, help="Output directory.")
+    parser.add_argument("--tuned-params", type=str, default=None,
+                        help="Tuned-parameter file written by benchmarks.mnist.tuning.")
     args = parser.parse_args(argv)
 
-    cfg, output = load_trainable_config(args.config, quick=args.quick, seed=args.seed, reports_dir=args.reports_dir)
+    cfg, output = load_trainable_config(args.config, quick=args.quick, seed=args.seed, reports_dir=args.reports_dir,
+                                        tuned_params_path=args.tuned_params)
     start = time.perf_counter()
     raw = run_experiment(cfg, output)
     text, summary = build_report(raw)

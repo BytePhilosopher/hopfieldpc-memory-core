@@ -1,6 +1,6 @@
 """Task 13: MNIST prototype retrieval, Baseline vs Hopfield as a controlled experiment.
 
-Both variants are the same CNN (``benchmarks.mnist_baseline``). The only
+Both variants are the same CNN (``benchmarks.mnist.baseline``). The only
 difference is layer L8, between the embedding z (L7) and the classifier head
 (L9):
 
@@ -9,16 +9,23 @@ difference is layer L8, between the embedding z (L7) and the classifier head
 
 M holds 8 k-means prototypes per class of the training embeddings, centered
 by the train-mean embedding, as a frozen buffer, so the Hopfield variant adds
-zero trainable parameters and nothing is retrained. beta is selected on clean
-+ noisy validation sets. Every experiment varies one parameter, every
+zero trainable parameters and nothing is retrained. beta* is selected on clean
++ noisy validation sets by ``benchmarks.mnist.tuning`` and read from
+``benchmarks/mnist/tuned_params.json``. Every experiment varies one parameter, every
 Baseline-vs-Hopfield pair is evaluated on the same (seeded) test images and
 compared with an exact McNemar test per seed and an exact Wilcoxon
 signed-rank test across seeds.
 
+Layer changes live in their own modules: ``hopfield_l5`` (memory after L5),
+``hopfield_trainable`` (trainable memory) and ``hopfield_recentering``
+(test-batch centering at L8); ``hopfield_mnist_c`` evaluates this module's
+networks on MNIST-C.
+
 Run from the repository root:
 
-    python -m benchmarks.mnist_prototype_retrieval            # everything
-    python -m benchmarks.mnist_prototype_retrieval --quick    # smoke run
+    python -m benchmarks.mnist.tuning              # once: baseline lr/batch/epochs and every beta
+    python -m benchmarks.mnist.hopfield            # E1-E9
+    python -m benchmarks.mnist.hopfield --quick    # smoke run (tune once with --quick first)
 """
 
 from __future__ import annotations
@@ -30,16 +37,14 @@ import math
 import time
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from benchmarks.mnist_baseline import (
-    MNIST_C_CORRUPTION_GROUPS,
-    MNIST_C_UNCORRUPTED_NAME,
+from benchmarks.mnist.baseline import (
     NOISE_TYPES,
     BaselineRun,
     ClassifierHead,
@@ -47,6 +52,7 @@ from benchmarks.mnist_baseline import (
     MnistEncoder,
     accuracy_auc_over_severity,
     analytical_macs,
+    apply_baseline_params,
     build_arg_parser,
     compute_prototypes,
     config_from_args,
@@ -54,8 +60,6 @@ from benchmarks.mnist_baseline import (
     copy_net,
     count_buffer_values,
     count_trainable_params,
-    encode,
-    ensure_mnist_c_downloaded,
     environment_info,
     format_split_table,
     format_tuning_table,
@@ -64,18 +68,18 @@ from benchmarks.mnist_baseline import (
     hook_macs,
     interleaved_cost,
     load_mnist,
-    load_mnist_c_test_set,
     mean_std,
     median_iqr,
     model_size_bytes,
     nearest_prototype,
     noise_grids,
     prepare_baseline_run,
+    require_tuned,
     resolve_device,
     split_table,
     summarize_outputs,
     time_full_evaluation,
-    tune_baseline,
+    train_size,
 )
 from hopfieldpc import HopfieldMemory
 from hopfieldpc.api import validate_beta
@@ -91,10 +95,7 @@ HOPFIELD_COLOR = "#eb6834"
 
 RULE = "═" * 96
 MODELS = ("baseline", "hopfield")
-CORRUPTION_READOUTS = ("baseline", "hopfield", "nearest_prototype")
 QUERY_CENTERING_MODES = ("train_mean", "test_batch_mean")
-MIXED_CORRUPTIONS_NAME = "mixed_corruptions"
-RECENTERING_DETAIL_BATCH_SIZE = 256
 NOISE_LABELS = {"gaussian": "σ", "salt_pepper": "p", "occlusion": "side"}
 E3_IDS = {"gaussian": "E3a", "salt_pepper": "E3b", "occlusion": "E3c"}
 
@@ -569,8 +570,73 @@ def select_beta(betas: list[float], curves: list[list[float]]) -> tuple[float, l
 # ---------------------------------------------------------------------------
 
 
+L8_SECTION = "hopfield_l8"
+
+
+def memory_fingerprint(cfg: dict[str, Any], num_train: int, betas: Sequence[float]) -> dict[str, Any]:
+    """Settings a beta selected on validation data depends on (frozen backbone, memory, grid)."""
+    return {
+        "backbone": {
+            **{k: cfg[k] for k in ("epochs", "batch_size", "lr", "val_size")},
+            "num_train": num_train,
+            "architecture": [32, 64, 128, 64],
+        },
+        "beta_values": list(betas),
+        "selection_sets": [list(s) for s in cfg["beta_selection_sets"]],
+        "prototypes_per_class": cfg["prototypes_per_class"],
+        "center_prototypes": cfg["center_prototypes"],
+    }
+
+
+def l8_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
+    return {**memory_fingerprint(cfg, num_train, cfg["beta_values"]), "placements": cfg["placements"]}
+
+
+def hopfield_l8_params(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any]:
+    """Stored beta*, pixel beta, memory-variant betas and their validation curves."""
+    return require_tuned(cfg, L8_SECTION, l8_fingerprint(cfg, train_size(cfg, data)))
+
+
+@dataclass
+class SeedNets:
+    """The Hopfield networks of one seed, all sharing the seed's frozen backbone."""
+
+    hop: EmbeddingClassifier
+    variants: dict[str, EmbeddingClassifier]
+    pixel: PixelHopfieldNet | None
+
+
+def build_seed_nets(
+    cfg: dict[str, Any],
+    run: BaselineRun,
+    *,
+    beta: float,
+    variant_betas: dict[str, float] | None = None,
+    beta_pixel: float | None = None,
+) -> SeedNets:
+    """Configured L8 net, every memory-design variant, and the pixel-placement net."""
+    configured = (cfg["prototypes_per_class"], cfg["center_prototypes"])
+    hop = build_embedding_net(run, *configured, beta=beta)
+    variants: dict[str, EmbeddingClassifier] = {}
+    for name, per_class, center in memory_variants(configured):
+        variants[name] = hop if (per_class, center) == configured else build_embedding_net(
+            run, per_class, center, beta=(variant_betas or {}).get(name, beta)
+        )
+    pixel_net = None
+    if "pixel" in cfg["placements"]:
+        flat = run.splits.train_images.flatten(1)
+        pixel_protos, pixel_labels = compute_prototypes(flat, run.splits.train_labels)
+        built = build_hopfield_net(
+            run.net, pixel_protos, pixel_labels, beta=beta_pixel if beta_pixel is not None else beta,
+            placement="pixel", center=flat.mean(dim=0),
+        )
+        assert isinstance(built, PixelHopfieldNet)
+        pixel_net = built
+    return SeedNets(hop=hop, variants=variants, pixel=pixel_net)
+
+
 def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, Any]:
-    """Run E0-E8 for every configured seed and return all raw results."""
+    """Run E0-E9 for every configured seed with the stored tuned values; nothing is tuned here."""
     threads = configure_threads(cfg["cost"]["num_threads"])
     device = resolve_device(cfg["device"])
     env = environment_info(device)
@@ -578,16 +644,24 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
     data = load_mnist(cfg["data_dir"])
     betas = cfg["beta_values"]
 
-    # Stage 0: split sizes (logged first), then tune the baseline before any
-    # backbone is trained; the winning lr / batch / epochs are written into cfg.
+    # Stage 0: split sizes, then the stored baseline tuning (lr / batch / epochs -> cfg)
+    # and the stored validation-selected betas (benchmarks.mnist.tuning).
     splits_info = split_table(cfg, data)
     print("Data splits\n" + "\n".join(format_split_table(splits_info)))
-    tuning = tune_baseline(cfg, data, device, retrain=retrain)
+    tuning = apply_baseline_params(cfg, data)
     if tuning is not None:
-        print("Baseline tuning\n" + "\n".join(format_tuning_table(tuning)))
-
-    # Stage 1: frozen baselines, memories, Hopfield nets, validation curves.
+        print("Baseline tuning (stored)\n" + "\n".join(format_tuning_table(tuning)))
+    tuned = hopfield_l8_params(cfg, data)
+    beta_star: float = tuned["beta_star"]
+    beta_pixel: float | None = tuned["beta_pixel"]
+    variant_betas: dict[str, float] = tuned["variant_betas"]
+    val_curves: dict[str, list[list[float]]] = tuned["val_curves"]
+    mean_val_curve: list[float] = tuned["mean_val_curve"]
     sel_sets = cfg["beta_selection_sets"]
+    print(f"beta* = {beta_star:g} (stored; validation head_acc on {selection_label(sel_sets)},"
+          f" tuned on seeds {tuned['seeds']})")
+
+    # Stage 1: frozen baselines, memories, Hopfield nets.
     configured = (cfg["prototypes_per_class"], cfg["center_prototypes"])
     variants = memory_variants(configured)
     runs: list[BaselineRun] = []
@@ -595,44 +669,16 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
     variant_nets: dict[str, list[EmbeddingClassifier]] = {name: [] for name, _, _ in variants}
     pixel_nets: list[PixelHopfieldNet | None] = []
     setup_times: list[float] = []
-    val_curves: dict[str, list[list[float]]] = {"embedding": [], "pixel": []}
-    variant_curves: dict[str, list[list[float]]] = {name: [] for name, _, _ in variants}
     for seed in cfg["seeds"]:
         run = prepare_baseline_run(cfg, data, seed, device, retrain=retrain)
         start = time.perf_counter()
-        hop = build_embedding_net(run, *configured, beta=betas[0])
+        nets = build_seed_nets(cfg, run, beta=beta_star, variant_betas=variant_betas, beta_pixel=beta_pixel)
         setup_times.append(run.prototype_time_s + time.perf_counter() - start)
-        val_curves["embedding"].append(validation_accuracy_by_beta(hop, run, betas, sel_sets))
-
-        for name, per_class, center in variants:
-            net = hop if (per_class, center) == configured else build_embedding_net(
-                run, per_class, center, beta=betas[0]
-            )
-            variant_nets[name].append(net)
-            variant_curves[name].append(
-                val_curves["embedding"][-1] if net is hop
-                else validation_accuracy_by_beta(net, run, betas, sel_sets)
-            )
-
-        pixel_net = None
-        if "pixel" in cfg["placements"]:
-            flat = run.splits.train_images.flatten(1)
-            pixel_protos, pixel_labels = compute_prototypes(flat, run.splits.train_labels)
-            pixel_net = build_hopfield_net(
-                run.net, pixel_protos, pixel_labels, beta=betas[0],
-                placement="pixel", center=flat.mean(dim=0),
-            )
-            assert isinstance(pixel_net, PixelHopfieldNet)
-            val_curves["pixel"].append(validation_accuracy_by_beta(pixel_net, run, betas, sel_sets, pixel=True))
+        for name in variant_nets:
+            variant_nets[name].append(nets.variants[name])
         runs.append(run)
-        hop_nets.append(hop)
-        pixel_nets.append(pixel_net)
-
-    beta_star, mean_val_curve = select_beta(betas, val_curves["embedding"])
-    beta_pixel = select_beta(betas, val_curves["pixel"])[0] if val_curves["pixel"] else None
-    variant_betas = {name: select_beta(betas, c)[0] for name, c in variant_curves.items()}
-    print(f"beta* = {beta_star:g} (validation head_acc on {selection_label(sel_sets)},"
-          " ties -> smallest beta)")
+        hop_nets.append(nets.hop)
+        pixel_nets.append(nets.pixel)
 
     # Stage 2: paired test-set experiments.
     results: dict[str, list[dict[str, Any]]] = {}
@@ -1562,8 +1608,9 @@ def plot_costs(raw: dict[str, Any], path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Corruption suite (MNIST-C)
+# Multiple-comparison helpers (shared by the corruption and placement experiments)
 # ---------------------------------------------------------------------------
+
 
 
 def holm_adjusted_p_values(p_values: Sequence[float]) -> list[float]:
@@ -1595,718 +1642,12 @@ def spearman_correlation(xs: Sequence[float], ys: Sequence[float]) -> float | No
     return covariance / scale if scale > 0 else None
 
 
-def evaluate_readouts_on_test_set(
-    baseline_net: EmbeddingClassifier,
-    hopfield_net: EmbeddingClassifier,
-    query_embeddings: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    prototypes: torch.Tensor,
-    memory_labels: torch.Tensor,
-    beta: float,
-    hard_readout_beta: float,
-    batch_size: int,
-    device: torch.device,
-) -> dict[str, dict[str, Any]]:
-    """Paired metrics of all three readouts on one embedded test set; dataset-independent.
-
-    ``nearest_prototype`` is the Hopfield layer at a very large beta, where the
-    softmax becomes a hard choice (check S1 verifies this equivalence). Each
-    non-baseline readout also carries its McNemar counts against the baseline.
-    """
-    bridge = hopfield_net.bridge
-    assert isinstance(bridge, HopfieldRetrievalLayer)
-
-    def run(net: EmbeddingClassifier) -> dict[str, torch.Tensor]:
-        return forward_embeddings(net, query_embeddings, batch_size=batch_size, device=device)
-
-    outputs = {"baseline": run(baseline_net)}
-    bridge.set_retrieval(beta=hard_readout_beta)
-    outputs["nearest_prototype"] = run(hopfield_net)
-    bridge.set_retrieval(beta=beta)
-    outputs["hopfield"] = run(hopfield_net)
-
-    evaluated: dict[str, dict[str, Any]] = {}
-    correct: dict[str, torch.Tensor] = {}
-    for readout in CORRUPTION_READOUTS:
-        metrics, per_sample, _ = summarize_outputs(outputs[readout], labels, prototypes, memory_labels)
-        correct[readout] = per_sample["head"]
-        evaluated[readout] = {**metrics, "mcnemar_b": None, "mcnemar_c": None, "mcnemar_p": None}
-        if readout != "baseline":
-            test = mcnemar_test(correct["baseline"], correct[readout])
-            evaluated[readout].update(mcnemar_b=test["b"], mcnemar_c=test["c"], mcnemar_p=test["p"])
-    return evaluated
-
-
-def _paired_summary(
-    first_by_seed: Sequence[float],
-    second_by_seed: Sequence[float],
-) -> dict[str, Any]:
-    """Mean ± std of both sides, Δ (first − second) and across-seed statistics."""
-    deltas = [a - b for a, b in zip(first_by_seed, second_by_seed)]
-    return {
-        "first": mean_std(first_by_seed),
-        "second": mean_std(second_by_seed),
-        "delta": sum(deltas) / len(deltas),
-        "delta_std": mean_std(deltas)[1],
-        **seed_stats(deltas),
-    }
-
-
-def summarize_corruption_suite(
-    rows: Sequence[dict[str, Any]],
-    corruption_groups: dict[str, tuple[str, ...]],
-) -> dict[str, Any]:
-    """Overall, per-group and per-corruption comparisons from flat per-seed rows.
-
-    The main result is the mean accuracy over all corruptions (Hopfield −
-    Baseline, Wilcoxon across seeds). Group and corruption results are
-    secondary, so their Wilcoxon p-values are Holm-adjusted within each family
-    and the winner is decided on the adjusted p-value.
-    """
-    seeds = sorted({r["seed"] for r in rows})
-    by_key = {(r["seed"], r["corruption"], r["readout"]): r for r in rows}
-    corruptions = [name for names in corruption_groups.values() for name in names]
-
-    def accuracy_by_seed(readout: str, names: Sequence[str]) -> list[float]:
-        return [
-            sum(by_key[(s, name, readout)]["head_acc"] for name in names) / len(names)
-            for s in seeds
-        ]
-
-    def compare(first: str, second: str, names: Sequence[str]) -> dict[str, Any]:
-        return _paired_summary(accuracy_by_seed(first, names), accuracy_by_seed(second, names))
-
-    def hopfield_mean(name: str, metric: str) -> float:
-        return sum(by_key[(s, name, "hopfield")][metric] for s in seeds) / len(seeds)
-
-    overall = {
-        "hopfield_vs_baseline": compare("hopfield", "baseline", corruptions),
-        "nearest_prototype_vs_baseline": compare("nearest_prototype", "baseline", corruptions),
-        "hopfield_vs_nearest_prototype": compare("hopfield", "nearest_prototype", corruptions),
-    }
-    for comparison in overall.values():
-        comparison["winner"] = None
-        if comparison["wilcoxon_p"] is not None:
-            significant = abs(comparison["delta"]) >= WINNER_DELTA and comparison["wilcoxon_p"] < ALPHA
-            comparison["significant"] = significant
-            comparison["winner"] = "first" if significant and comparison["delta"] > 0 else (
-                "second" if significant else "tie"
-            )
-
-    per_group = [{"group": g, **compare("hopfield", "baseline", names)}
-                 for g, names in corruption_groups.items()]
-    per_corruption = []
-    for group, names in corruption_groups.items():
-        for name in names:
-            comparison = compare("hopfield", "baseline", [name])
-            tests = [by_key[(s, name, "hopfield")] for s in seeds]
-            comparison.update(
-                corruption=name,
-                group=group,
-                nearest_prototype=mean_std(accuracy_by_seed("nearest_prototype", [name])),
-                mcnemar_p=max(t["mcnemar_p"] for t in tests),
-                seed_signs=[(t["mcnemar_c"] > t["mcnemar_b"]) - (t["mcnemar_c"] < t["mcnemar_b"])
-                            for t in tests],
-                embedding_shift=hopfield_mean(name, "embedding_shift"),
-                entropy_norm=hopfield_mean(name, "entropy_norm"),
-                true_proto_weight=hopfield_mean(name, "true_proto_weight"),
-            )
-            per_corruption.append(comparison)
-
-    for family in (per_group, per_corruption):
-        have_wilcoxon = all(item["wilcoxon_p"] is not None for item in family)
-        adjusted = (holm_adjusted_p_values([item["wilcoxon_p"] for item in family])
-                    if have_wilcoxon else [None] * len(family))
-        for item, holm_p in zip(family, adjusted):
-            item["holm_p"] = holm_p
-            if holm_p is not None:
-                item["winner"] = decide_winner(item["delta"], holm_p, (), holm_p)
-            elif "mcnemar_p" in item:
-                item["winner"] = decide_winner(item["delta"], item["mcnemar_p"], item["seed_signs"])
-            else:
-                item["winner"] = None
-
-    return {
-        "overall": overall,
-        "per_group": per_group,
-        "per_corruption": per_corruption,
-        "shift_gain_spearman": spearman_correlation(
-            [c["embedding_shift"] for c in per_corruption], [c["delta"] for c in per_corruption]
-        ),
-    }
-
-
-def prepare_mnist_c_nets(
-    cfg: dict[str, Any],
-    *,
-    retrain: bool = False,
-) -> tuple[torch.device, list[BaselineRun], list[EmbeddingClassifier], float, list[float]]:
-    """Frozen backbones, Hopfield nets and beta*, selected on the validation sets only.
-
-    MNIST-C is never used to select or tune anything. Backbones come from the
-    same cache as the main experiment, so nothing is retrained when that cache
-    matches the config.
-    """
-    threads = configure_threads(cfg["cost"]["num_threads"])
-    device = resolve_device(cfg["device"])
-    print(f"Device: {device}  threads: {threads}  torch {torch.__version__}")
-    data = load_mnist(cfg["data_dir"])
-    ensure_mnist_c_downloaded(cfg["data_dir"])
-    tune_baseline(cfg, data, device, retrain=retrain)
-
-    betas = cfg["mnist_c_beta_values"]
-    selection_sets = cfg["beta_selection_sets"]
-    per_class, center = cfg["prototypes_per_class"], cfg["center_prototypes"]
-    runs: list[BaselineRun] = []
-    hopfield_nets: list[EmbeddingClassifier] = []
-    validation_curves: list[list[float]] = []
-    for seed in cfg["seeds"]:
-        run = prepare_baseline_run(cfg, data, seed, device, retrain=retrain)
-        hopfield_net = build_embedding_net(run, per_class, center, beta=betas[0])
-        validation_curves.append(validation_accuracy_by_beta(hopfield_net, run, betas, selection_sets))
-        runs.append(run)
-        hopfield_nets.append(hopfield_net)
-    beta_star, mean_validation_curve = select_beta(betas, validation_curves)
-    print(f"beta* = {beta_star:g} (validation head_acc on {selection_label(selection_sets)})")
-    return device, runs, hopfield_nets, beta_star, mean_validation_curve
-
-
-def run_mnist_c_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, Any]:
-    """Evaluate the frozen Baseline and Hopfield nets on every MNIST-C test set."""
-    device, runs, hopfield_nets, beta_star, mean_validation_curve = prepare_mnist_c_nets(
-        cfg, retrain=retrain
-    )
-    betas = cfg["mnist_c_beta_values"]
-    selection_sets = cfg["beta_selection_sets"]
-    rows: list[dict[str, Any]] = []
-    uncorrupted_accuracy_gaps: list[float] = []
-    hard_readout_agreement: list[float] = []
-    shared_weights_ok: list[bool] = []
-    clean_images = runs[0].splits.test_images
-    uncorrupted_images, uncorrupted_labels = load_mnist_c_test_set(
-        cfg["data_dir"], MNIST_C_UNCORRUPTED_NAME, test_subset=cfg["test_subset"]
-    )
-    images_match = torch.equal(uncorrupted_images, clean_images)
-    labels_match = torch.equal(uncorrupted_labels, runs[0].splits.test_labels)
-    if not labels_match:
-        raise ValueError("MNIST-C labels do not match the MNIST test labels; results would be invalid.")
-
-    set_groups = {MNIST_C_UNCORRUPTED_NAME: "uncorrupted"}
-    set_groups.update({n: g for g, names in MNIST_C_CORRUPTION_GROUPS.items() for n in names})
-    for run, hopfield_net in zip(runs, hopfield_nets):
-        print(f"  seed {run.seed}: evaluating {len(set_groups)} MNIST-C test sets")
-        bridge = hopfield_net.bridge
-        assert isinstance(bridge, HopfieldRetrievalLayer)
-        bridge.set_retrieval(beta=beta_star, num_updates=1)
-        offset = bridge.center.cpu() if bridge.center is not None else torch.zeros(run.z_train.shape[1])
-        clean_embeddings = run.test_embeddings("gaussian", 0.0)
-        shared_weights_ok.append(shared_weights_equal(run.net, hopfield_net))
-
-        for corruption, group in set_groups.items():
-            images, labels = load_mnist_c_test_set(
-                cfg["data_dir"], corruption, test_subset=cfg["test_subset"]
-            )
-            if not torch.equal(labels, run.splits.test_labels):
-                raise ValueError(f"MNIST-C {corruption} labels do not match the MNIST test labels.")
-            query_embeddings = encode(run.net.encoder, images, batch_size=run.batch_size, device=device)
-            shift = 1.0 - F.cosine_similarity(
-                query_embeddings - offset, clean_embeddings - offset, dim=-1
-            ).mean().item()
-            evaluated = evaluate_readouts_on_test_set(
-                run.net, hopfield_net, query_embeddings, labels,
-                prototypes=run.prototypes, memory_labels=run.memory_labels,
-                beta=beta_star, hard_readout_beta=cfg["s1_beta"],
-                batch_size=run.batch_size, device=device,
-            )
-            for readout, metrics in evaluated.items():
-                rows.append({"seed": run.seed, "corruption": corruption, "group": group,
-                             "readout": readout, "embedding_shift": shift, **metrics})
-            if corruption == MNIST_C_UNCORRUPTED_NAME:
-                clean_out = forward_embeddings(
-                    run.net, clean_embeddings, batch_size=run.batch_size, device=device
-                )
-                clean_acc = (clean_out["head_pred"] == labels).float().mean().item()
-                uncorrupted_accuracy_gaps.append(abs(evaluated["baseline"]["head_acc"] - clean_acc))
-                bridge.set_retrieval(beta=cfg["s1_beta"])
-                hard_out = forward_embeddings(
-                    hopfield_net, query_embeddings, batch_size=run.batch_size, device=device
-                )
-                bridge.set_retrieval(beta=beta_star)
-                memory = bridge.prototypes.cpu()
-                nearest = bridge.memory_labels.cpu()[
-                    nearest_prototype(query_embeddings - offset, memory - offset)
-                ]
-                hard_readout_agreement.append((hard_out["proto_pred"] == nearest).float().mean().item())
-
-    return {
-        "config": cfg,
-        "environment": environment_info(device),
-        "beta_star": beta_star,
-        "beta_values": betas,
-        "mean_validation_curve": mean_validation_curve,
-        "beta_selection": selection_label(selection_sets),
-        "rows": rows,
-        "n_test": int(labels.shape[0]),
-        "num_cached_backbones": sum(run.from_cache for run in runs),
-        "sanity": {
-            "uncorrupted_images_match_mnist": images_match,
-            "labels_match_mnist": labels_match,
-            "uncorrupted_accuracy_gap": max(uncorrupted_accuracy_gaps),
-            "hard_readout_agreement": min(hard_readout_agreement),
-            "shared_weights_identical": all(shared_weights_ok),
-        },
-        "summary": summarize_corruption_suite(rows, MNIST_C_CORRUPTION_GROUPS),
-    }
-
-
-def format_mnist_c_report(raw: dict[str, Any]) -> str:
-    """Render the MNIST-C result tables, the sanity report and the verdict."""
-    summary = raw["summary"]
-    sanity = raw["sanity"]
-    cfg = raw["config"]
-    n_seeds = len(cfg["seeds"])
-    beta_star = raw["beta_star"]
-    context = (f"seeds={n_seeds}  n_test={raw['n_test']}  β*={beta_star:g}"
-               f" (selected on {raw['beta_selection']})  backbones reused from cache:"
-               f" {raw['num_cached_backbones']}/{n_seeds}")
-    lines = table_header(
-        "MNIST-C", "Main result: mean head_acc over the 15 corruptions", "readout",
-        "encoder and head weights, clean training, β*", context,
-    )
-
-    def seeds(item: dict[str, Any]) -> str:
-        return f"{item['n_pos']}/{item['n_neg']}"
-
-    lines.append(f"  {'Comparison':<36} │ {'First':>17} │ {'Second':>17} │ {'Δ':>9} │"
-                 f" {'Seeds +/−':>9} │ {'Wilcoxon p':>10}")
-    titles = {
-        "hopfield_vs_baseline": "Hopfield vs Baseline (main)",
-        "nearest_prototype_vs_baseline": "Nearest prototype vs Baseline",
-        "hopfield_vs_nearest_prototype": "Hopfield vs Nearest prototype",
-    }
-    for key, title in titles.items():
-        c = summary["overall"][key]
-        lines.append(f"  {title:<36} │ {_ms(c['first']):>17} │ {_ms(c['second']):>17} │"
-                     f" {_signed(c['delta']):>9} │ {seeds(c):>9} │ {_p(c['wilcoxon_p']):>10}")
-
-    lines += ["", *table_header(
-        "MNIST-C", "Hopfield vs Baseline per corruption group", "corruption group",
-        "as above", "Winner uses Holm-adjusted Wilcoxon p across the 6 groups",
-    )]
-    lines.append(f"  {'Group':<21} │ {'Baseline':>17} │ {'Hopfield':>17} │ {'Δ (H−B)':>9} │"
-                 f" {'Seeds +/−':>9} │ {'Holm p':>8} │ Winner")
-    for g in summary["per_group"]:
-        lines.append(f"  {g['group']:<21} │ {_ms(g['second']):>17} │ {_ms(g['first']):>17} │"
-                     f" {_signed(g['delta']):>9} │ {seeds(g):>9} │ {_p(g['holm_p']):>8} │"
-                     f" {g['winner'] or '—'}")
-
-    lines += ["", *table_header(
-        "MNIST-C", "Hopfield vs Baseline per corruption", "corruption",
-        "as above", "McNemar p = max over seeds; winner uses Holm-adjusted Wilcoxon p across 15 corruptions",
-    )]
-    lines.append(f"  {'Corruption':<14} │ {'Baseline':>7} │ {'Hopfield':>8} │ {'Nearest':>7} │ {'Δ (H−B)':>8} │"
-                 f" {'McNemar p':>9} │ {'Seeds +/−':>9} │ {'Holm p':>7} │ {'Winner':<8} │"
-                 f" {'Shift':>6} │ {'Entropy':>7} │ {'True wt':>7}")
-    for c in summary["per_corruption"]:
-        lines.append(
-            f"  {c['corruption']:<14} │ {c['second'][0]:>7.4f} │ {c['first'][0]:>8.4f} │"
-            f" {c['nearest_prototype'][0]:>7.4f} │ {_signed(c['delta']):>8} │ {_p(c['mcnemar_p']):>9} │"
-            f" {seeds(c):>9} │ {_p(c['holm_p']):>7} │ {c['winner']:<8} │ {c['embedding_shift']:>6.3f} │"
-            f" {c['entropy_norm']:>7.3f} │ {c['true_proto_weight']:>7.3f}"
-        )
-    correlation = summary["shift_gain_spearman"]
-    lines.append("  Shift = 1 − cosine(corrupted z, clean z) after centering; Entropy and True wt are Hopfield retrieval.")
-    lines.append("  Spearman(Shift, Δ) across corruptions = "
-                 f"{'—' if correlation is None else format(correlation, '+.3f')} (descriptive only)")
-
-    checks = [
-        ("uncorrupted set is pixel-identical to the MNIST test set", sanity["uncorrupted_images_match_mnist"], ""),
-        ("labels match the MNIST test labels", sanity["labels_match_mnist"], ""),
-        ("uncorrupted accuracy equals clean accuracy", sanity["uncorrupted_accuracy_gap"] == 0,
-         f"max gap {sanity['uncorrupted_accuracy_gap']:.6f}"),
-        ("β=s1_beta readout equals the nearest prototype", sanity["hard_readout_agreement"] >= 0.999,
-         f"min agreement {sanity['hard_readout_agreement']:.4f}"),
-        ("Baseline and Hopfield share identical weights", sanity["shared_weights_identical"], ""),
-    ]
-    lines += ["", " Sanity checks"]
-    for name, passed, detail in checks:
-        lines.append(f"  {'PASS' if passed else 'FAIL'}  {name}{f'  ({detail})' if detail else ''}")
-    betas = raw["beta_values"]
-    if beta_star == betas[-1]:
-        lines.append(f"  NOTE  β* = {beta_star:g} is the top of the selection grid; the best value may be higher.")
-
-    main_result = summary["overall"]["hopfield_vs_baseline"]
-    wins = {name: sum(c["winner"] == name for c in summary["per_corruption"])
-            for name in ("Hopfield", "Baseline", "tie", "mixed")}
-    if main_result["winner"] is None:
-        outcome = "not tested (needs at least 6 seeds)"
-    else:
-        outcome = {"first": "Hopfield wins", "second": "Baseline wins", "tie": "tie"}[main_result["winner"]]
-    lines += ["", f" VERDICT: {outcome} on mean accuracy over 15 corruptions"
-                  f" (Δ {_signed(main_result['delta'] * 100, 2)} pp, Wilcoxon p {_p(main_result['wilcoxon_p'])});"
-                  f" per corruption: Hopfield {wins['Hopfield']}, Baseline {wins['Baseline']},"
-                  f" tie {wins['tie']}" + (f", mixed {wins['mixed']}" if wins["mixed"] else "") + "."]
-    return "\n".join(lines)
-
-
-def plot_mnist_c_gains(raw: dict[str, Any], path: Path) -> bool:
-    """mnist_c_plot.png: Hopfield − Baseline accuracy per corruption, with seed std."""
-    plt = _import_pyplot()
-    if plt is None:
-        return False
-    per_corruption = sorted(raw["summary"]["per_corruption"], key=lambda c: c["delta"])
-    gains = [c["delta"] * 100 for c in per_corruption]
-    errors = [c["delta_std"] * 100 for c in per_corruption]
-    colors = [HOPFIELD_COLOR if gain >= 0 else BASELINE_COLOR for gain in gains]
-    positions = range(len(per_corruption))
-    fig, ax = plt.subplots(figsize=(9, 6.5))
-    ax.barh(positions, gains, height=0.55, color=colors,
-            xerr=errors, error_kw={"ecolor": "#52514e", "elinewidth": 1, "capsize": 2})
-    ax.axvline(0, color="#52514e", linewidth=1)
-    ax.set_yticks(list(positions))
-    ax.set_yticklabels([f"{c['corruption']} ({c['group']})" for c in per_corruption], fontsize=9)
-    ax.legend(
-        handles=[plt.Rectangle((0, 0), 1, 1, color=HOPFIELD_COLOR, label="Hopfield better"),
-                 plt.Rectangle((0, 0), 1, 1, color=BASELINE_COLOR, label="Baseline better")],
-        frameon=False, loc="lower right",
-    )
-    _style(ax, f"MNIST-C: Hopfield − Baseline accuracy, mean ± std over {len(raw['config']['seeds'])} seed(s)",
-           "accuracy difference (percentage points)", "")
-    ax.grid(False, axis="y")
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=130, facecolor="#fcfcfb")
-    plt.close(fig)
-    return True
-
-
-def save_mnist_c_reports(raw: dict[str, Any], text: str, output_dir: Path) -> None:
-    """Write the mnist_c_* report files; files of the main experiment are not touched."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "mnist_c_summary.md").write_text(
-        f"# MNIST-C: Baseline vs Hopfield\n\n```\n{text}\n```\n", encoding="utf-8"
-    )
-    with open(output_dir / "mnist_c_results.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(raw["rows"][0]))
-        writer.writeheader()
-        writer.writerows(raw["rows"])
-    with open(output_dir / "mnist_c_results.json", "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2, default=str)
-    plot_mnist_c_gains(raw, output_dir / "mnist_c_plot.png")
-
-
-# ---------------------------------------------------------------------------
-# Test-batch recentering (MNIST-C)
-# ---------------------------------------------------------------------------
-
-
-class BatchRecenteringLayer(nn.Module):
-    """L8 for the recentered baseline: move the batch mean onto the train mean, no retrieval.
-
-    z [B, D] -> h = z - mean(z over the batch) + train_mean [B, D].
-    """
-
-    def __init__(self, train_mean: torch.Tensor) -> None:
-        super().__init__()
-        self.register_buffer("train_mean", train_mean.detach().clone().float())
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return z - z.mean(dim=0, keepdim=True) + self.train_mean
-
-
-def mix_corruptions(
-    embeddings_by_corruption: Sequence[torch.Tensor],
-    *,
-    seed: int,
-) -> torch.Tensor:
-    """Give each test image [N, D] the embedding of one randomly chosen corruption.
-
-    Image order is kept, so the result stays paired with the test labels and a
-    batch holds different corruptions, which is the hard case for recentering.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    num_images = embeddings_by_corruption[0].shape[0]
-    chosen = torch.randint(0, len(embeddings_by_corruption), (num_images,), generator=generator)
-    return torch.stack(list(embeddings_by_corruption))[chosen, torch.arange(num_images)]
-
-
-def _recentering_rows(
-    readout: str,
-    batch_size: int | None,
-    predictions: torch.Tensor,
-    baseline_predictions: torch.Tensor,
-    labels: torch.Tensor,
-    **identity: Any,
-) -> dict[str, Any]:
-    """One flat result row: accuracy and McNemar against the train-mean baseline."""
-    test = mcnemar_test(baseline_predictions == labels, predictions == labels)
-    return {**identity, "readout": readout, "batch_size": batch_size,
-            "head_acc": (predictions == labels).float().mean().item(),
-            "mcnemar_b": test["b"], "mcnemar_c": test["c"], "mcnemar_p": test["p"]}
-
-
-def run_mnist_c_recentering_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, Any]:
-    """Compare train-mean and test-batch centering for both variants on MNIST-C.
-
-    Every test set runs at every configured batch size, because the batch mean
-    gets noisier as batches shrink. Train-mean readouts do not depend on batch
-    size and are evaluated once. beta* is selected exactly as for ``--mnist-c``.
-    """
-    device, runs, hopfield_nets, beta_star, _ = prepare_mnist_c_nets(cfg, retrain=retrain)
-    corruption_names = [n for names in MNIST_C_CORRUPTION_GROUPS.values() for n in names]
-    rows: list[dict[str, Any]] = []
-    shared_weights_ok: list[bool] = []
-    test_subset = cfg["test_subset"]
-
-    for run, hopfield_net in zip(runs, hopfield_nets):
-        print(f"  seed {run.seed}: evaluating recentering")
-        bridge = hopfield_net.bridge
-        assert isinstance(bridge, HopfieldRetrievalLayer) and bridge.center is not None
-        bridge.set_retrieval(beta=beta_star, num_updates=1)
-        shared_weights_ok.append(shared_weights_equal(run.net, hopfield_net))
-        recentered_baseline = EmbeddingClassifier(
-            run.net.encoder, BatchRecenteringLayer(bridge.center), run.net.head
-        ).eval()
-        labels = run.splits.test_labels
-
-        embeddings: dict[str, torch.Tensor] = {}
-        for name in [MNIST_C_UNCORRUPTED_NAME, *corruption_names]:
-            images, set_labels = load_mnist_c_test_set(cfg["data_dir"], name, test_subset=test_subset)
-            if not torch.equal(set_labels, labels):
-                raise ValueError(f"MNIST-C {name} labels do not match the MNIST test labels.")
-            embeddings[name] = encode(run.net.encoder, images, batch_size=run.batch_size, device=device)
-        embeddings[MIXED_CORRUPTIONS_NAME] = mix_corruptions(
-            [embeddings[name] for name in corruption_names], seed=run.seed
-        )
-
-        def predict(net: EmbeddingClassifier, z: torch.Tensor, batch_size: int) -> torch.Tensor:
-            return forward_embeddings(net, z, batch_size=batch_size, device=device)["head_pred"]
-
-        for name, query_embeddings in embeddings.items():
-            identity = {"seed": run.seed, "test_set": name}
-            bridge.set_retrieval(query_centering="train_mean")
-            baseline = predict(run.net, query_embeddings, run.batch_size)
-            hopfield = predict(hopfield_net, query_embeddings, run.batch_size)
-            rows.append(_recentering_rows("baseline", None, baseline, baseline, labels, **identity))
-            rows.append(_recentering_rows("hopfield", None, hopfield, baseline, labels, **identity))
-            bridge.set_retrieval(query_centering="test_batch_mean")
-            for batch_size in cfg["recentering_batch_sizes"]:
-                rows.append(_recentering_rows(
-                    "baseline_recentered", batch_size,
-                    predict(recentered_baseline, query_embeddings, batch_size), baseline, labels, **identity,
-                ))
-                rows.append(_recentering_rows(
-                    "hopfield_recentered", batch_size,
-                    predict(hopfield_net, query_embeddings, batch_size), baseline, labels, **identity,
-                ))
-        bridge.set_retrieval(query_centering="train_mean")
-
-    return {
-        "config": cfg,
-        "environment": environment_info(device),
-        "beta_star": beta_star,
-        "rows": rows,
-        "n_test": int(runs[0].splits.test_labels.shape[0]),
-        "num_cached_backbones": sum(run.from_cache for run in runs),
-        "shared_weights_identical": all(shared_weights_ok),
-        "summary": summarize_recentering(rows, corruption_names, cfg["recentering_batch_sizes"]),
-    }
-
-
-def summarize_recentering(
-    rows: Sequence[dict[str, Any]],
-    corruption_names: Sequence[str],
-    batch_sizes: Sequence[int],
-) -> dict[str, Any]:
-    """Recentered Hopfield vs each reference, per batch size and per corruption.
-
-    Each table is one family: Wilcoxon p-values are Holm-adjusted within it,
-    per comparison, and the winner is decided on the adjusted p-value.
-    """
-    seeds = sorted({r["seed"] for r in rows})
-    by_key = {(r["seed"], r["test_set"], r["readout"], r["batch_size"]): r["head_acc"] for r in rows}
-
-    def accuracy_by_seed(readout: str, names: Sequence[str], batch_size: int) -> list[float]:
-        key_batch = batch_size if readout.endswith("_recentered") else None
-        return [sum(by_key[(s, n, readout, key_batch)] for n in names) / len(names) for s in seeds]
-
-    def comparison_row(names: Sequence[str], batch_size: int) -> dict[str, Any]:
-        recentered = accuracy_by_seed("hopfield_recentered", names, batch_size)
-        return {
-            "accuracy": {r: mean_std(accuracy_by_seed(r, names, batch_size)) for r in
-                         ("baseline", "hopfield", "baseline_recentered", "hopfield_recentered")},
-            "vs_baseline": _paired_summary(recentered, accuracy_by_seed("baseline", names, batch_size)),
-            "vs_hopfield": _paired_summary(recentered, accuracy_by_seed("hopfield", names, batch_size)),
-            "vs_baseline_recentered": _paired_summary(
-                recentered, accuracy_by_seed("baseline_recentered", names, batch_size)
-            ),
-        }
-
-    def adjust(family: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for key in ("vs_baseline", "vs_hopfield", "vs_baseline_recentered"):
-            have_wilcoxon = all(item[key]["wilcoxon_p"] is not None for item in family)
-            adjusted = (holm_adjusted_p_values([item[key]["wilcoxon_p"] for item in family])
-                        if have_wilcoxon else [None] * len(family))
-            for item, holm_p in zip(family, adjusted):
-                item[key]["holm_p"] = holm_p
-                item[key]["winner"] = (None if holm_p is None
-                                       else decide_winner(item[key]["delta"], holm_p, (), holm_p))
-        return family
-
-    def by_batch(names: Sequence[str]) -> list[dict[str, Any]]:
-        return adjust([{"batch_size": b, **comparison_row(names, b)} for b in batch_sizes])
-
-    detail_batch = (RECENTERING_DETAIL_BATCH_SIZE if RECENTERING_DETAIL_BATCH_SIZE in batch_sizes
-                    else batch_sizes[-1])
-    return {
-        "mean_over_corruptions": by_batch(corruption_names),
-        "mixed_corruptions": by_batch([MIXED_CORRUPTIONS_NAME]),
-        "uncorrupted": by_batch([MNIST_C_UNCORRUPTED_NAME]),
-        "detail_batch_size": detail_batch,
-        "per_corruption": adjust([{"corruption": n, **comparison_row([n], detail_batch)}
-                                  for n in corruption_names]),
-    }
-
-
-def format_recentering_report(
-    raw: dict[str, Any],
-    *,
-    dataset_name: str = "MNIST-C",
-    metric: str = "head_acc",
-) -> str:
-    """Render the recentering tables, the sanity report and the verdict."""
-    summary = raw["summary"]
-    n_seeds = len(raw["config"]["seeds"])
-    context = (f"seeds={n_seeds}  n_test={raw['n_test']}  β*={raw['beta_star']:g}  backbones reused"
-               f" from cache: {raw['num_cached_backbones']}/{n_seeds}")
-    held = "encoder and head weights, clean training, β*, 8 prototypes per class"
-
-    def comparison_cells(item: dict[str, Any]) -> str:
-        base, ref = item["vs_baseline"], item["vs_baseline_recentered"]
-        acc = item["accuracy"]
-        return (
-            f"{acc['baseline'][0]:>8.4f} │ {acc['hopfield'][0]:>8.4f} │ {acc['baseline_recentered'][0]:>8.4f} │"
-            f" {acc['hopfield_recentered'][0]:>8.4f} │ {_signed(base['delta']):>8} │"
-            f" {base['n_pos']}/{base['n_neg']:<3} │ {_p(base['holm_p']):>7} │ {base['winner'] or '—':<8} │"
-            f" {_signed(ref['delta']):>8} │ {ref['n_pos']}/{ref['n_neg']:<3} │ {_p(ref['holm_p']):>7}"
-        )
-
-    def table_columns(first: str, width: int) -> list[str]:
-        return [
-            (f"  {first:>{width}} │ {'Baseline':>8} │ {'Hopfield':>8} │ {'Base rec':>8} │ {'Hop rec':>8} │"
-             f" {'HR−B':>8} │ {'+/−':<5} │ {'Holm p':>7} │ {'Winner':<8} │ {'HR−BR':>8} │ {'+/−':<5} │ {'Holm p':>7}"),
-        ]
-
-    lines: list[str] = []
-    tables = (
-        ("mean_over_corruptions", f"Mean {metric} over the 15 corruptions (each batch holds one corruption)"),
-        ("mixed_corruptions", "Mixed corruptions (each image has a random corruption)"),
-        ("uncorrupted", "Uncorrupted MNIST test set (the price of recentering)"),
-    )
-    for key, title in tables:
-        lines += [*table_header(dataset_name, title, "batch size", held, context), *table_columns("batch", 6)]
-        lines += [f"  {item['batch_size']:>6} │ {comparison_cells(item)}" for item in summary[key]]
-        lines.append("")
-
-    lines += table_header(
-        dataset_name, f"Per corruption at batch size {summary['detail_batch_size']}", "corruption", held,
-        "HR = Hopfield recentered, B = Baseline, BR = Baseline recentered; Holm across 15 corruptions",
-    )
-    lines += table_columns("Corruption", 14)
-    lines += [f"  {item['corruption']:>14} │ {comparison_cells(item)}" for item in summary["per_corruption"]]
-
-    lines += ["", " Sanity checks",
-              f"  {'PASS' if raw['shared_weights_identical'] else 'FAIL'}  Baseline and Hopfield share identical weights"]
-    lines += ["", " VERDICT (Hopfield recentered vs Baseline, mean over 15 corruptions):"]
-    for item in summary["mean_over_corruptions"]:
-        base = item["vs_baseline"]
-        mixed = next(m for m in summary["mixed_corruptions"] if m["batch_size"] == item["batch_size"])
-        clean = next(u for u in summary["uncorrupted"] if u["batch_size"] == item["batch_size"])
-        lines.append(
-            f"  batch {item['batch_size']:>4}: {base['winner'] or 'not tested'}"
-            f" (Δ {_signed(base['delta'] * 100, 2)} pp, Holm p {_p(base['holm_p'])});"
-            f" mixed Δ {_signed(mixed['vs_baseline']['delta'] * 100, 2)} pp;"
-            f" uncorrupted Δ {_signed(clean['vs_baseline']['delta'] * 100, 2)} pp"
-        )
-    return "\n".join(lines)
-
-
-def plot_recentering(raw: dict[str, Any], path: Path, *, metric: str = "head_acc") -> bool:
-    """Accuracy vs batch size for the three test conditions (mixed and uncorrupted stay head_acc)."""
-    plt = _import_pyplot()
-    if plt is None:
-        return False
-    panels = (("mean_over_corruptions", "Mean over 15 corruptions"),
-              ("mixed_corruptions", "Mixed corruptions"),
-              ("uncorrupted", "Uncorrupted"))
-    series = (("baseline", "Baseline", BASELINE_COLOR, "--"),
-              ("hopfield", "Hopfield", HOPFIELD_COLOR, "--"),
-              ("baseline_recentered", "Baseline recentered", BASELINE_COLOR, "-"),
-              ("hopfield_recentered", "Hopfield recentered", HOPFIELD_COLOR, "-"))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
-    for ax, (key, title) in zip(axes, panels):
-        items = raw["summary"][key]
-        xs = [item["batch_size"] for item in items]
-        for readout, label, color, style in series:
-            ax.plot(xs, [item["accuracy"][readout][0] for item in items], color=color, linestyle=style,
-                    linewidth=2, marker="o", markersize=5, label=label)
-        ax.set_xscale("log")
-        ax.set_xticks(xs)
-        ax.set_xticklabels([str(x) for x in xs])
-        ax.minorticks_off()
-        _style(ax, title, "batch size (log scale)", metric if key == "mean_over_corruptions" else "head_acc")
-    axes[0].legend(frameon=False, fontsize=9, handlelength=4)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=130, facecolor="#fcfcfb")
-    plt.close(fig)
-    return True
-
-
-def save_recentering_reports(raw: dict[str, Any], text: str, output_dir: Path) -> None:
-    """Write the mnist_c_recentering_* files; no other report is touched."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "mnist_c_recentering_summary.md").write_text(
-        f"# MNIST-C: test-batch recentering\n\n```\n{text}\n```\n", encoding="utf-8"
-    )
-    with open(output_dir / "mnist_c_recentering_results.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(raw["rows"][0]))
-        writer.writeheader()
-        writer.writerows(raw["rows"])
-    with open(output_dir / "mnist_c_recentering_results.json", "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2, default=str)
-    plot_recentering(raw, output_dir / "mnist_c_recentering_plot.png")
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = build_arg_parser(
-        "Task 13: MNIST prototype retrieval, Baseline vs Hopfield (one variable at a time)."
+        "Task 13: MNIST prototype retrieval, Baseline vs Hopfield at L8 (one variable at a time)."
     )
-    parser.add_argument("--mnist-c", action="store_true",
-                        help="Evaluate on MNIST-C using the cached backbones instead of running E1-E9.")
-    parser.add_argument("--mnist-c-recentering", action="store_true",
-                        help="Compare train-mean and test-batch centering on MNIST-C.")
     args = parser.parse_args(argv)
     cfg = config_from_args(args)
-    if args.mnist_c_recentering:
-        print(f"Running MNIST-C recentering from {args.config}{' (quick)' if cfg['quick'] else ''}")
-        recentering_raw = run_mnist_c_recentering_experiment(cfg, retrain=args.retrain)
-        recentering_text = format_recentering_report(recentering_raw)
-        print()
-        print(recentering_text)
-        save_recentering_reports(recentering_raw, recentering_text, Path(cfg["reports_dir"]))
-        print(f"\nReports saved to: {cfg['reports_dir']}")
-        return
-    if args.mnist_c:
-        print(f"Running MNIST-C from {args.config}{' (quick)' if cfg['quick'] else ''}")
-        mnist_c_raw = run_mnist_c_experiment(cfg, retrain=args.retrain)
-        mnist_c_text = format_mnist_c_report(mnist_c_raw)
-        print()
-        print(mnist_c_text)
-        save_mnist_c_reports(mnist_c_raw, mnist_c_text, Path(cfg["reports_dir"]))
-        print(f"\nReports saved to: {cfg['reports_dir']}")
-        return
     print(f"Running Task 13 from {args.config}{' (quick)' if cfg['quick'] else ''}")
     raw = run_experiment(cfg, retrain=args.retrain)
     text, summary = build_report(raw)

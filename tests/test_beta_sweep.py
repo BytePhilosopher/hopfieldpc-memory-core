@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 
-from benchmarks.beta_sweep import (
+from benchmarks.synthetic.beta_sweep import (
     evaluate_beta_retrieval,
     plot_beta_sweep,
     run_beta_sweep,
@@ -92,7 +92,7 @@ def test_identical_data_used_for_every_beta(monkeypatch: pytest.MonkeyPatch) -> 
             normalize=normalize,
         )
 
-    monkeypatch.setattr("benchmarks.beta_sweep.evaluate_beta_retrieval", mock_evaluate)
+    monkeypatch.setattr("benchmarks.synthetic.beta_sweep.evaluate_beta_retrieval", mock_evaluate)
 
     config: dict[str, Any] = {
         "seed": 7,

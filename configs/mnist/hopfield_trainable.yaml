@@ -1,6 +1,9 @@
 # Trainable Hopfield memory on MNIST. Seeds, splits, test grids, frozen backbones and the initial
-# memory design come from source_config; the fixed betas come from the L5 experiment's results.
-source_config: "configs/mnist_prototype_retrieval.yaml"
+# memory design come from source_config. The fixed betas and the memory tuning below are read from
+# benchmarks/mnist/tuned_params.json (written once by `python -m benchmarks.mnist.tuning`).
+source_config: "configs/mnist/hopfield.yaml"
+l5_config: "configs/mnist/hopfield_l5.yaml"
+# Optional: the L5 experiment's results, used only to check that the fixed L5 model repeats them.
 fixed_results: "reports/mnist_l5_hopfield/results.json"
 reports_dir: "reports/mnist_trainable_hopfield"
 
@@ -17,7 +20,7 @@ cluster_weight: 0.1       # pull toward the closest prototype of the true class
 separation_weight: 0.01   # push away from the closest prototype of another class
 center_ema: 0.99          # L8 only in Stage B: L6-L7 move z, so the center follows it
 
-# Grid on one seed, scored on validation data only, before any trained model is tested.
+# Grid on one seed, scored on validation data only (run by benchmarks.mnist.tuning, stored once).
 tuning:
   seed: 0
   train_images: 10000

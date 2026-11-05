@@ -241,7 +241,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/synthetic_retrieval.yaml"),
+        default=Path("configs/synthetic/synthetic_retrieval.yaml"),
         help="Path to YAML config file."
     )
     parser.add_argument(

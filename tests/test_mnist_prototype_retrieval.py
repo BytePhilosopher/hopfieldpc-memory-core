@@ -18,10 +18,16 @@ import pytest
 import torch
 from torch import nn
 
-import benchmarks.cifar10_c_retrieval as cifar
-import benchmarks.mnist_baseline as mb
-import benchmarks.mnist_prototype_retrieval as mb_retrieval
-from benchmarks.mnist_baseline import (
+import benchmarks.cifar10.baseline as cifar_base
+import benchmarks.cifar10.hopfield as cifar
+import benchmarks.cifar10.tuning as cifar_tuning
+import benchmarks.mnist.baseline as mb
+import benchmarks.mnist.hopfield as mb_retrieval
+import benchmarks.mnist.hopfield_mnist_c as mnist_c
+import benchmarks.mnist.hopfield_recentering as recentering
+import benchmarks.mnist.tuning as mnist_tuning
+from benchmarks.common.tuned_params import TunedParamsError
+from benchmarks.mnist.baseline import (
     ClassifierHead,
     EmbeddingClassifier,
     MnistEncoder,
@@ -36,8 +42,7 @@ from benchmarks.mnist_baseline import (
     nearest_prototype,
     validate_mnist_config,
 )
-from benchmarks.mnist_prototype_retrieval import (
-    BatchRecenteringLayer,
+from benchmarks.mnist.hopfield import (
     HopfieldRetrievalLayer,
     PixelHopfieldNet,
     build_hopfield_net,
@@ -48,11 +53,11 @@ from benchmarks.mnist_prototype_retrieval import (
     main,
     mcnemar_exact_p,
     mcnemar_test,
-    mix_corruptions,
     shared_weights_equal,
     spearman_correlation,
     wilcoxon_signed_rank_p,
 )
+from benchmarks.mnist.hopfield_recentering import BatchRecenteringLayer, mix_corruptions
 from hopfieldpc.diagnostics import attention_entropy
 
 
@@ -429,18 +434,47 @@ quick:
 """
 
 
+def tune_quick(config_path: Path, tmp_path: Path, *sections: str, data_dir: str | None = None) -> Path:
+    """Run benchmarks.mnist.tuning --quick into a temporary tuned-parameter file."""
+    tuned = tmp_path / "tuned_params.json"
+    argv = ["--quick", "--config", str(config_path), "--reports-dir", str(tmp_path / "reports"),
+            "--tuned-params", str(tuned), "--only", *sections]
+    mnist_tuning.main(argv + (["--data-dir", data_dir] if data_dir else []))
+    return tuned
+
+
 def test_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # Same CLI call as a user's --quick run; only the default config is shrunk for speed.
+    # Same CLI calls as a user's --quick run; only the default config is shrunk for speed.
     config_path = tmp_path / "tiny.yaml"
     config_path.write_text(TINY_CONFIG, encoding="utf-8")
     monkeypatch.setattr(mb, "DEFAULT_CONFIG_PATH", config_path)
     monkeypatch.setattr(mb, "load_mnist_tensors", synthetic_mnist)
-    main(["--quick", "--reports-dir", str(tmp_path)])
+    reports = tmp_path / "reports"
 
-    for name in ("summary.md", "results.csv", "results.json", "plots.png", "cost.png",
-                 "baseline_tuning.json"):
-        assert (tmp_path / name).exists(), name
-    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    # Experiments never tune: without stored values they stop and name the command to run.
+    with pytest.raises(TunedParamsError, match="benchmarks.mnist.tuning --quick"):
+        main(["--quick", "--reports-dir", str(reports), "--tuned-params", str(tmp_path / "tuned_params.json")])
+
+    tuned = tune_quick(config_path, tmp_path, "baseline", "hopfield_l8")
+    stored = json.loads(tuned.read_text(encoding="utf-8"))["quick"]
+    assert len(stored["baseline"]["values"]["grid"]) == 4
+    best = stored["baseline"]["values"]["best_scores"]["val_score"]
+    assert all(r["val_score"] <= best for r in stored["baseline"]["values"]["grid"])
+    assert stored["hopfield_l8"]["values"]["beta_star"] in (1.0, 100.0)
+
+    # Tuning again is a no-op: nothing is trained or scored.
+    monkeypatch.setattr(mnist_tuning, "train_baseline", lambda *a, **k: pytest.fail("baseline was tuned again"))
+    monkeypatch.setattr(mnist_tuning, "validation_accuracy_by_beta", lambda *a, **k: pytest.fail("beta tuned again"))
+    assert tune_quick(config_path, tmp_path, "baseline", "hopfield_l8").read_text(encoding="utf-8") \
+        == tuned.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(mb_retrieval, "validation_accuracy_by_beta",
+                        lambda *a, **k: pytest.fail("the experiment selected beta itself"))
+    main(["--quick", "--reports-dir", str(reports), "--tuned-params", str(tuned)])
+
+    for name in ("summary.md", "results.csv", "results.json", "plots.png", "cost.png"):
+        assert (reports / name).exists(), name
+    summary = (reports / "summary.md").read_text(encoding="utf-8")
     for token in ("Varied:", "Held fixed:", "Baseline", "Hopfield", "VERDICT"):
         assert token in summary
     for i in range(1, 12):
@@ -449,13 +483,21 @@ def test_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         assert f" {exp}  " in summary
     assert "memory=30 prototypes (3/class, centered)" in summary
     assert "mean of val clean + gaussian 0.4 + salt_pepper 0.15" in summary
-    # Split table is the first section; tuning (4 grid points) comes right after it.
+    # Split table is the first section; tuning comes right after it.
     assert summary.index("E0 Data splits") < summary.index("E0b Baseline tuning") < summary.index(" E1  ")
     for split in ("train", "validation", "test"):
         assert f"  {split} " in summary
-    tuning = json.loads((tmp_path / "baseline_tuning.json").read_text(encoding="utf-8"))
-    assert len(tuning["grid"]) == 4
-    assert all(r["val_score"] <= tuning["best_scores"]["val_score"] for r in tuning["grid"])
+
+
+def test_changed_settings_make_stored_tuning_stale(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "tiny.yaml"
+    config_path.write_text(TINY_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(mb, "load_mnist_tensors", synthetic_mnist)
+    tuned = tune_quick(config_path, tmp_path, "baseline")
+    config_path.write_text(TINY_CONFIG.replace("lr_values: [0.001, 0.003]", "lr_values: [0.001]"), encoding="utf-8")
+    cfg = mb.load_config(config_path, quick=True, tuned_params_path=str(tuned))
+    with pytest.raises(TunedParamsError, match="changed: tuning"):
+        mb.apply_baseline_params(cfg, mb.load_mnist("unused"))
 
 
 def test_holm_adjustment_is_monotone_and_keeps_input_order() -> None:
@@ -495,7 +537,7 @@ def test_summarize_corruption_suite_uses_holm_for_the_winner() -> None:
                     "head_acc": acc, "embedding_shift": 0.1, "entropy_norm": 0.1,
                     "true_proto_weight": 0.9, "mcnemar_b": 0, "mcnemar_c": 5, "mcnemar_p": 0.01,
                 })
-    summary = mb_retrieval.summarize_corruption_suite(rows, groups)
+    summary = mnist_c.summarize_corruption_suite(rows, groups)
     winners = {c["corruption"]: c["winner"] for c in summary["per_corruption"]}
     assert winners == {"strong": "Hopfield", "weak": "Hopfield", "flat": "tie"}
     assert summary["overall"]["hopfield_vs_baseline"]["n_pos"] == 10
@@ -526,7 +568,9 @@ def test_mnist_c_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path:
     install_fake_mnist_c(monkeypatch, tmp_path)
 
     reports = tmp_path / "reports"
-    main(["--mnist-c", "--quick", "--reports-dir", str(reports), "--data-dir", str(tmp_path / "data")])
+    tuned = tune_quick(tmp_path / "tiny.yaml", tmp_path, "baseline", "hopfield_mnist_c", data_dir=str(tmp_path / "data"))
+    mnist_c.main(["--quick", "--reports-dir", str(reports), "--data-dir", str(tmp_path / "data"),
+                  "--tuned-params", str(tuned)])
 
     for name in ("mnist_c_summary.md", "mnist_c_results.csv", "mnist_c_results.json", "mnist_c_plot.png"):
         assert (reports / name).exists(), name
@@ -586,8 +630,9 @@ def test_mix_corruptions_keeps_image_order_and_is_seeded() -> None:
 def test_mnist_c_recentering_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     install_fake_mnist_c(monkeypatch, tmp_path)
     reports = tmp_path / "reports"
-    main(["--mnist-c-recentering", "--quick", "--reports-dir", str(reports),
-          "--data-dir", str(tmp_path / "data")])
+    tuned = tune_quick(tmp_path / "tiny.yaml", tmp_path, "baseline", "hopfield_mnist_c", data_dir=str(tmp_path / "data"))
+    recentering.main(["--quick", "--reports-dir", str(reports), "--data-dir", str(tmp_path / "data"),
+                      "--tuned-params", str(tuned)])
 
     for name in ("summary.md", "results.csv", "results.json", "plot.png"):
         assert (reports / f"mnist_c_recentering_{name}").exists(), name
@@ -601,7 +646,7 @@ def test_mnist_c_recentering_end_to_end_quick_run(monkeypatch: pytest.MonkeyPatc
 def test_random_crop_and_flip_keeps_shape_and_uses_source_pixels() -> None:
     torch.manual_seed(0)
     images = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).reshape(2, 3, 8, 8)
-    out = cifar.random_crop_and_flip(images, padding=2)
+    out = cifar_base.random_crop_and_flip(images, padding=2)
     assert out.shape == images.shape
     assert set(out.flatten().tolist()) <= set(images.flatten().tolist())
     # All channels of one pixel come from the same source position.
@@ -609,14 +654,14 @@ def test_random_crop_and_flip_keeps_shape_and_uses_source_pixels() -> None:
 
 
 def test_cifar_encoder_output_shape_and_channel_order() -> None:
-    encoder = cifar.CifarResNetEncoder(base_width=2, embed_dim=8).eval()
+    encoder = cifar_base.CifarResNetEncoder(base_width=2, embed_dim=8).eval()
     assert encoder(torch.rand(4, 3, 32, 32)).shape == (4, 8)
 
 
 def test_load_cifar10_c_selects_the_requested_severity_block(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(cifar, "IMAGES_PER_SEVERITY", 2)
+    monkeypatch.setattr(cifar_base, "IMAGES_PER_SEVERITY", 2)
     root = tmp_path / "CIFAR-10-C"
     root.mkdir()
     pixels = np.zeros((10, 32, 32, 3), dtype=np.uint8)
@@ -624,19 +669,19 @@ def test_load_cifar10_c_selects_the_requested_severity_block(
         pixels[index] = index
     np.save(root / "fog.npy", pixels)
     np.save(root / "labels.npy", np.arange(10) % 10)
-    images, labels = cifar.load_cifar10_c_test_set(tmp_path, "fog", 3)
+    images, labels = cifar_base.load_cifar10_c_test_set(tmp_path, "fog", 3)
     assert images.shape == (2, 3, 32, 32)
     assert labels.tolist() == [4, 5]
     assert images[0, 0, 0, 0].item() == pytest.approx(4 / 255)
     with pytest.raises(ValueError, match="severity"):
-        cifar.load_cifar10_c_test_set(tmp_path, "fog", 6)
+        cifar_base.load_cifar10_c_test_set(tmp_path, "fog", 6)
 
 
 def test_collapse_to_severity_auc_includes_clean_as_severity_zero() -> None:
     rows = [{"seed": 0, "test_set": "identity", "severity": 0, "readout": "baseline",
              "batch_size": None, "head_acc": 1.0}]
     rows += [{"seed": 0, "test_set": "fog", "severity": s, "readout": "baseline", "batch_size": None,
-              "head_acc": 1.0 - s * 0.2} for s in cifar.SEVERITIES]
+              "head_acc": 1.0 - s * 0.2} for s in cifar_base.SEVERITIES]
     collapsed = cifar.collapse_to_severity_auc(rows)
     fog = next(r for r in collapsed if r["test_set"] == "fog")
     assert fog["head_acc"] == pytest.approx(0.5)
@@ -653,15 +698,23 @@ def _tiny_cifar_data(train: bool) -> tuple[torch.Tensor, torch.Tensor]:
     return images.clamp(0, 1).mul(255).round().to(torch.uint8).float().div(255), labels
 
 
-def test_cifar10_c_end_to_end_resumes_without_rework(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(cifar, "IMAGES_PER_SEVERITY", 40)
+def install_tiny_cifar(monkeypatch: pytest.MonkeyPatch) -> None:
     train_images, train_labels = _tiny_cifar_data(True)
     test_images, test_labels = _tiny_cifar_data(False)
-    monkeypatch.setattr(cifar, "load_cifar10", lambda _: (train_images, train_labels, test_images, test_labels))
+    data = (train_images, train_labels, test_images, test_labels)
+    for module in (cifar, cifar_tuning):
+        monkeypatch.setattr(module, "load_cifar10", lambda _: data)
+
+
+def test_cifar10_c_end_to_end_resumes_without_rework(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for module in (cifar, cifar_base):
+        monkeypatch.setattr(module, "IMAGES_PER_SEVERITY", 40)
+    install_tiny_cifar(monkeypatch)
+    test_images, test_labels = _tiny_cifar_data(False)
     root = tmp_path / "data" / "CIFAR-10-C"
     root.mkdir(parents=True)
     pixels = test_images.mul(255).round().to(torch.uint8).permute(0, 2, 3, 1).numpy()
-    for name in cifar.CORRUPTION_NAMES:
+    for name in cifar_base.CORRUPTION_NAMES:
         np.save(root / f"{name}.npy", np.concatenate([pixels] * 5))
     np.save(root / "labels.npy", np.concatenate([test_labels.numpy()] * 5))
 
@@ -669,21 +722,28 @@ def test_cifar10_c_end_to_end_resumes_without_rework(monkeypatch: pytest.MonkeyP
         data_dir=str(tmp_path / "data"), output_dir=str(tmp_path / "out"), seeds=[0], base_width=2,
         embed_dim=8, epochs=1, batch_size=32, val_size=50, min_clean_val_accuracy=0.0,
         prototypes_per_class=2, beta_values=[1.0, 100.0], eval_batch_size=64,
+        tuned_params=str(tmp_path / "tuned_params.json"),
     )
+    with pytest.raises(TunedParamsError, match="benchmarks.cifar10.tuning"):
+        cifar.run_experiment(cfg)
+    tuned = cifar_tuning.tune(cfg)
+    assert tuned["beta_star"] in (1.0, 100.0) and tuned["num_cached_backbones"] == 0
     raw, text = cifar.run_experiment(cfg)
     for name in ("cifar10_c_summary.md", "cifar10_c_results.csv", "cifar10_c_results.json", "cifar10_c_plot.png",
                  "backbone_seed0.pt", "validation_seed0.json", "results_seed0.json"):
         assert (tmp_path / "out" / name).exists(), name
     assert "CIFAR-10-C" in text and "VERDICT" in text and "FAIL" not in text
     assert "accuracy AUC over severity" in text and "Soft vs hard retrieval" in text
-    assert raw["num_cached_backbones"] == 0
+    assert raw["num_cached_backbones"] == 0 and raw["beta_star"] == tuned["beta_star"]
 
-    # A rerun after a disconnect must not train or evaluate again.
+    # A rerun after a disconnect must not train, tune or evaluate again.
     def fail(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("work was repeated on resume")
 
-    monkeypatch.setattr(cifar, "train_backbone", fail)
+    monkeypatch.setattr(cifar_base, "train_backbone", fail)
     monkeypatch.setattr(cifar, "prepare_seed_run", fail)
+    monkeypatch.setattr(cifar_tuning, "prepare_seed_run", fail)
+    assert cifar_tuning.tune(cfg) == tuned
     _, resumed = cifar.run_experiment(cfg)
     assert resumed == text
 
@@ -691,9 +751,8 @@ def test_cifar10_c_end_to_end_resumes_without_rework(monkeypatch: pytest.MonkeyP
 def test_cifar10_c_stops_before_test_data_when_validation_accuracy_is_low(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    train_images, train_labels = _tiny_cifar_data(True)
-    test_images, test_labels = _tiny_cifar_data(False)
-    monkeypatch.setattr(cifar, "load_cifar10", lambda _: (train_images, train_labels, test_images, test_labels))
+    install_tiny_cifar(monkeypatch)
+
     def fail_download(_: Any) -> None:
         raise AssertionError("corrupted data was requested")
 
@@ -701,10 +760,11 @@ def test_cifar10_c_stops_before_test_data_when_validation_accuracy_is_low(
     cfg = cifar.Cifar10CConfig(
         data_dir=str(tmp_path), output_dir=str(tmp_path / "out"), seeds=[0], base_width=2, embed_dim=8,
         epochs=1, batch_size=32, val_size=50, min_clean_val_accuracy=1.01, prototypes_per_class=2,
-        beta_values=[1.0], eval_batch_size=64,
+        beta_values=[1.0], eval_batch_size=64, tuned_params=str(tmp_path / "tuned_params.json"),
     )
     with pytest.raises(SystemExit, match="below"):
-        cifar.run_experiment(cfg)
+        cifar_tuning.tune(cfg)
+    assert not (tmp_path / "tuned_params.json").exists()
 
 
 def test_cifar10_c_refuses_to_run_without_a_gpu_unless_allowed(monkeypatch: pytest.MonkeyPatch) -> None:

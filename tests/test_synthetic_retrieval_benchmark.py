@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from benchmarks.synthetic_retrieval import run_benchmark
+from benchmarks.synthetic.synthetic_retrieval import run_benchmark
 from hopfieldpc.diagnostics import (
     attention_entropy,
     retrieval_distance,

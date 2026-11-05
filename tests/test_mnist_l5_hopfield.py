@@ -8,13 +8,15 @@ from typing import Any
 import pytest
 import torch
 
-import benchmarks.mnist_l5_hopfield as l5
-from benchmarks.mnist_baseline import (
+import benchmarks.mnist.hopfield_l5 as l5
+import benchmarks.mnist.tuning as tuning
+from benchmarks.common.tuned_params import TunedParamsError
+from benchmarks.mnist.baseline import (
     build_baseline_net,
     checkpoint_fingerprint,
     make_splits,
 )
-from benchmarks.mnist_prototype_retrieval import shared_weights_equal
+from benchmarks.mnist.hopfield import shared_weights_equal
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -27,7 +29,7 @@ def synthetic_data() -> tuple[torch.Tensor, ...]:
 
 
 def tiny_config(reports_dir: Path) -> dict[str, Any]:
-    cfg, _ = l5.load_l5_config(REPO / "configs" / "mnist_l5_hopfield.yaml", quick=True)
+    cfg, _ = l5.load_l5_config(REPO / "configs" / "mnist" / "hopfield_l5.yaml", quick=True)
     cfg.update(
         reports_dir=str(reports_dir),
         seeds=[0],
@@ -46,6 +48,7 @@ def tiny_config(reports_dir: Path) -> dict[str, Any]:
         noisy_sigma=0.5,
         num_updates_values=[1, 2],
         device="cpu",
+        tuned_params=str(reports_dir / "tuned_params.json"),
     )
     cfg["cost"] = {**cfg["cost"], "batch_sizes": [2], "batch_size": 2, "warmup": 1, "iters": 1, "repeats": 1}
     return cfg
@@ -125,7 +128,13 @@ def test_end_to_end_writes_only_to_the_output_folder(tmp_path: Path, monkeypatch
     before = sorted(p.name for p in backbones.iterdir())
     monkeypatch.setattr(l5, "load_mnist", lambda _: data)
 
+    with pytest.raises(TunedParamsError, match="benchmarks.mnist.tuning"):
+        l5.run_experiment(cfg)
+    tuned = tuning.tune_hopfield_l5(cfg, data, torch.device("cpu"))
+    before = sorted(p.name for p in backbones.iterdir())
+    monkeypatch.setattr(l5, "validation_curve", lambda *a, **k: pytest.fail("the experiment selected beta itself"))
     raw = l5.run_experiment(cfg)
+    assert (raw["beta_l5"], raw["beta_l8"]) == (tuned["beta_l5"], tuned["beta_l8"])
     text, summary = l5.build_report(raw)
     output = tmp_path / "output"
     l5.save_reports(raw, text, summary, output)

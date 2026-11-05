@@ -2,7 +2,7 @@
 
 Run from the repository root as a module:
 
-    python -m benchmarks.cluster_retrieval --config configs/cluster_retrieval.yaml
+    python -m benchmarks.synthetic.cluster_retrieval --config configs/synthetic/cluster_retrieval.yaml
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import yaml
 
-from benchmarks.validation import validate_beta_values
+from benchmarks.common.validation import validate_beta_values
 from hopfieldpc.api import validate_beta
 from hopfieldpc.diagnostics import (
     argmax_memory_index,
@@ -1254,7 +1254,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/cluster_retrieval.yaml"),
+        default=Path("configs/synthetic/cluster_retrieval.yaml"),
         help="Path to YAML configuration file.",
     )
     parser.add_argument(

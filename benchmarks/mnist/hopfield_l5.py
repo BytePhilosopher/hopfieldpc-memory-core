@@ -7,15 +7,18 @@ All three models share the same frozen weights per seed:
     Hopfield@L8:  L1-L5 -> L6 -> L7 -> Hopfield(64) -> L9
 
 Memory for both placements is 8 k-means prototypes per class, centered by the
-train mean, with beta selected on validation data only. The backbones are
-loaded from the main experiment's reports directory and never trained here.
+train mean. beta for both placements was selected on validation data only by
+``benchmarks.mnist.tuning`` and is read from ``benchmarks/mnist/tuned_params.json``.
+The backbones are loaded from the main experiment's reports directory and
+never trained here.
 The main test, fixed before running, is Hopfield@L5 vs Baseline on Gaussian and
 salt-and-pepper robustness AUC (Wilcoxon across seeds, Holm-corrected over the two).
 
-Run from the repository root:
+Run from the repository root (tune once first):
 
-    python -m benchmarks.mnist_l5_hopfield            # 10 seeds
-    python -m benchmarks.mnist_l5_hopfield --quick    # smoke run
+    python -m benchmarks.mnist.tuning
+    python -m benchmarks.mnist.hopfield_l5            # 10 seeds
+    python -m benchmarks.mnist.hopfield_l5 --quick    # smoke run
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ import torch
 import yaml
 from torch import nn
 
-from benchmarks.mnist_baseline import (
+from benchmarks.mnist.baseline import (
     MNIST_MEAN,
     MNIST_STD,
     NOISE_TYPES,
@@ -43,6 +46,7 @@ from benchmarks.mnist_baseline import (
     MnistEncoder,
     accuracy_auc_over_severity,
     analytical_macs,
+    apply_baseline_params,
     checkpoint_fingerprint,
     configure_threads,
     copy_net,
@@ -60,10 +64,12 @@ from benchmarks.mnist_baseline import (
     nearest_prototype,
     noise_grids,
     prepare_baseline_run,
+    require_tuned,
     resolve_device,
     summarize_outputs,
+    train_size,
 )
-from benchmarks.mnist_prototype_retrieval import (
+from benchmarks.mnist.hopfield import (
     ALPHA,
     MIN_SEEDS_FOR_WILCOXON,
     WINNER_DELTA,
@@ -74,14 +80,14 @@ from benchmarks.mnist_prototype_retrieval import (
     build_prototype_memory,
     holm_adjusted_p_values,
     mcnemar_test,
+    memory_fingerprint,
     memory_variants,
-    select_beta,
     selection_label,
     shared_weights_equal,
     wilcoxon_signed_rank_p,
 )
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "mnist_l5_hopfield.yaml"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "mnist" / "hopfield_l5.yaml"
 
 MODELS = ("baseline", "hopfield_l5", "hopfield_l8")
 MODEL_LABELS = {"baseline": "Baseline", "hopfield_l5": "Hopfield@L5", "hopfield_l8": "Hopfield@L8"}
@@ -178,6 +184,27 @@ def build_l5_net(
 # ---------------------------------------------------------------------------
 
 
+def build_l5_variant_nets(
+    cfg: dict[str, Any],
+    run: BaselineRun,
+    betas: dict[str, float] | float,
+    *,
+    train_features: torch.Tensor | None = None,
+) -> dict[str, FlattenHopfieldNet]:
+    """Hopfield@L5 for every memory-design variant of one seed (``betas``: one value or per variant)."""
+    if train_features is None:
+        train_features = encode_features(
+            run.net.encoder, run.splits.train_images, batch_size=run.batch_size, device=run.device
+        )
+    nets = {}
+    for name, per_class, center in memory_variants((cfg["prototypes_per_class"], cfg["center_prototypes"])):
+        nets[name] = build_l5_net(
+            run.net, train_features, run.splits.train_labels, per_class=per_class, center=center,
+            beta=betas if isinstance(betas, float | int) else betas[name], seed=run.seed,
+        )
+    return nets
+
+
 def load_l5_config(
     path: Path,
     *,
@@ -185,34 +212,35 @@ def load_l5_config(
     seed: int | None = None,
     data_dir: str | None = None,
     reports_dir: str | None = None,
+    tuned_params_path: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    """Return (source config with the betas to use, output directory)."""
+    """Return (source config with the beta grid to use, output directory)."""
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-    cfg = load_config(Path(raw["source_config"]), quick=quick, seed=seed, data_dir=data_dir)
+    cfg = load_config(Path(raw["source_config"]), quick=quick, seed=seed, data_dir=data_dir,
+                      tuned_params_path=tuned_params_path)
     cfg["l5_betas"] = list(cfg[raw["beta_grid_key"]])
     output = reports_dir or raw["quick_reports_dir" if quick else "reports_dir"]
     return cfg, Path(output)
 
 
-def apply_cached_tuning(cfg: dict[str, Any]) -> dict[str, Any] | None:
-    """Write the main experiment's tuned lr / batch / epochs into ``cfg``, without tuning again."""
-    if cfg["baseline_tuning"] is None:
-        return None
-    path = Path(cfg["reports_dir"]) / "baseline_tuning.json"
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found; run benchmarks.mnist_prototype_retrieval first.")
-    with open(path, encoding="utf-8") as f:
-        tuning = json.load(f)
-    cfg.update(tuning["best"])
-    return tuning
+L5_SECTION = "hopfield_l5"
+
+
+def l5_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
+    return memory_fingerprint(cfg, num_train, cfg["l5_betas"])
+
+
+def hopfield_l5_params(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any]:
+    """Stored betas of both placements (and every L5 memory variant) with their validation curves."""
+    return require_tuned(cfg, L5_SECTION, l5_fingerprint(cfg, train_size(cfg, data)))
 
 
 def require_cached_backbone(cfg: dict[str, Any], data: Sequence[torch.Tensor], seed: int) -> None:
     """Stop unless the seed's backbone exists and matches, so these weights are never retrained."""
     path = Path(cfg["reports_dir"]) / f"backbone_seed{seed}.pt"
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found; run benchmarks.mnist_prototype_retrieval first.")
+        raise FileNotFoundError(f"{path} not found; run benchmarks.mnist.tuning (which trains it) first.")
     splits = make_splits(data, seed=seed, val_size=cfg["val_size"], train_subset=cfg["train_subset"])
     expected = checkpoint_fingerprint(cfg, seed, splits.train_images.shape[0])
     found = torch.load(path, map_location="cpu", weights_only=True).get("fingerprint")
@@ -323,13 +351,14 @@ def sanity_for_seed(
 
 
 def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Select beta on validation data, then run every paired test-set experiment."""
+    """Run every paired test-set experiment at the stored betas; nothing is tuned here."""
     threads = configure_threads(cfg["cost"]["num_threads"])
     device = resolve_device(cfg["device"])
     env = environment_info(device)
     print(f"Device: {device}  threads: {threads}  torch {torch.__version__}", flush=True)
     data = load_mnist(cfg["data_dir"])
-    tuning = apply_cached_tuning(cfg)
+    tuning = apply_baseline_params(cfg, data)
+    tuned = hopfield_l5_params(cfg, data)
     for seed in cfg["seeds"]:
         require_cached_backbone(cfg, data, seed)
 
@@ -337,43 +366,12 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
     sel_sets = cfg["beta_selection_sets"]
     configured = (cfg["prototypes_per_class"], cfg["center_prototypes"])
     variants = memory_variants(configured)
-
-    # Stage 1: memories and validation curves. L5 features are large, so they are freed per seed.
-    stored: dict[int, dict[str, Any]] = {}
-    curves_l5: dict[str, list[list[float]]] = {name: [] for name, _, _ in variants}
-    curves_l8: list[list[float]] = []
-    for seed in cfg["seeds"]:
-        start = time.perf_counter()
-        run = prepare_baseline_run(cfg, data, seed, device)
-        if not run.from_cache:
-            raise RuntimeError(f"seed {seed}: backbone was not loaded from cache.")
-        kw = {"batch_size": run.batch_size, "device": device}
-        train_features = encode_features(run.net.encoder, run.splits.train_images, **kw)
-        val_features = [
-            encode_features(run.net.encoder, run.val_images(kind, level), **kw) for kind, level in sel_sets
-        ]
-        val_z = [run.val_embeddings(kind, level) for kind, level in sel_sets]
-        labels = run.splits.val_labels
-
-        l5_nets = {}
-        for name, per_class, center in variants:
-            l5_nets[name] = build_l5_net(
-                run.net, train_features, run.splits.train_labels,
-                per_class=per_class, center=center, beta=betas[0], seed=seed,
-            )
-            curves_l5[name].append(validation_curve(l5_nets[name], val_features, labels, betas, **kw))
-        hop_l8 = build_embedding_net(run, *configured, beta=betas[0])
-        curves_l8.append(validation_curve(hop_l8, val_z, labels, betas, **kw))
-        stored[seed] = {"l5_nets": l5_nets, "hop_l8": hop_l8, "train_time_s": run.train_time_s}
-        print(f"  seed {seed}: memory and validation done in {time.perf_counter() - start:.0f}s", flush=True)
-        del run, train_features, val_features, val_z
-        gc.collect()
-
     configured_name = next(n for n, k, c in variants if (k, c) == configured)
-    variant_betas = {name: select_beta(betas, c)[0] for name, c in curves_l5.items()}
-    beta_l5 = variant_betas[configured_name]
-    beta_l8 = select_beta(betas, curves_l8)[0]
-    print(f"beta*: L5 = {beta_l5:g}, L8 = {beta_l8:g} ({selection_label(sel_sets)})", flush=True)
+    variant_betas: dict[str, float] = tuned["variant_betas"]
+    beta_l5: float = tuned["beta_l5"]
+    beta_l8: float = tuned["beta_l8"]
+    print(f"beta*: L5 = {beta_l5:g}, L8 = {beta_l8:g} (stored; {selection_label(sel_sets)},"
+          f" tuned on seeds {tuned['seeds']})", flush=True)
 
     # Stage 2: paired test-set experiments.
     results: dict[str, Any] = {}
@@ -384,8 +382,11 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
     for seed in cfg["seeds"]:
         start = time.perf_counter()
         run = prepare_baseline_run(cfg, data, seed, device)
-        hop_l5 = stored[seed]["l5_nets"][configured_name]
-        hop_l8 = stored[seed]["hop_l8"]
+        if not run.from_cache:
+            raise RuntimeError(f"seed {seed}: backbone was not loaded from cache.")
+        l5_nets = build_l5_variant_nets(cfg, run, variant_betas)
+        hop_l5 = l5_nets[configured_name]
+        hop_l8 = build_embedding_net(run, *configured, beta=beta_l8)
         hop_l5.bridge.set_retrieval(beta=beta_l5, num_updates=1)
         hop_l8.bridge.set_retrieval(beta=beta_l8, num_updates=1)
         nets = {"baseline": run.net, "hopfield_l5": hop_l5, "hopfield_l8": hop_l8}
@@ -416,7 +417,7 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
         hop_l5.bridge.set_retrieval(num_updates=1)
 
         for name, _, _ in variants:
-            variant = stored[seed]["l5_nets"][name]
+            variant = l5_nets[name]
             variant.bridge.set_retrieval(beta=variant_betas[name], num_updates=1)
             vpair = {"baseline": run.net, "hopfield_l5": variant}
             _add(results, "memory_clean", name, seed, evaluate_models(run, vpair, "gaussian", 0.0, clean),
@@ -428,8 +429,7 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
         if cost is None:
             cost = measure_costs(cfg, run, hop_l5, hop_l8, device)
         print(f"  seed {seed}: evaluated in {time.perf_counter() - start:.0f}s", flush=True)
-        stored[seed] = {}
-        del run, clean, noisy, nets, pair
+        del run, clean, noisy, nets, pair, l5_nets
         gc.collect()
 
     return {
@@ -441,8 +441,8 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
         "variant_betas": variant_betas,
         "betas": betas,
         "beta_selection": selection_label(sel_sets),
-        "val_curve_l5": select_beta(betas, curves_l5[configured_name])[1],
-        "val_curve_l8": select_beta(betas, curves_l8)[1],
+        "val_curve_l5": tuned["val_curve_l5"],
+        "val_curve_l8": tuned["val_curve_l8"],
         "n_test": int(data[2].shape[0]) if cfg["test_subset"] is None else cfg["test_subset"],
         "results": results,
         "sanity": sanity,
@@ -865,10 +865,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=None, help="Run a single seed.")
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--reports-dir", type=str, default=None, help="Output directory.")
+    parser.add_argument("--tuned-params", type=str, default=None,
+                        help="Tuned-parameter file written by benchmarks.mnist.tuning.")
     args = parser.parse_args(argv)
 
     cfg, output = load_l5_config(
-        args.config, quick=args.quick, seed=args.seed, data_dir=args.data_dir, reports_dir=args.reports_dir
+        args.config, quick=args.quick, seed=args.seed, data_dir=args.data_dir, reports_dir=args.reports_dir,
+        tuned_params_path=args.tuned_params,
     )
     start = time.perf_counter()
     raw = run_experiment(cfg)

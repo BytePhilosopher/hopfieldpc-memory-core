@@ -13,8 +13,8 @@ from typing import Any
 import torch
 import yaml
 
-from benchmarks.synthetic_retrieval import generate_memory, generate_noisy_queries
-from benchmarks.validation import validate_beta_values
+from benchmarks.synthetic.synthetic_retrieval import generate_memory, generate_noisy_queries
+from benchmarks.common.validation import validate_beta_values
 from hopfieldpc.diagnostics import (
     attention_entropy,
     max_attention_weight,
@@ -464,7 +464,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/beta_sweep.yaml"),
+        default=Path("configs/synthetic/beta_sweep.yaml"),
         help="Path to YAML configuration file.",
     )
     parser.add_argument(

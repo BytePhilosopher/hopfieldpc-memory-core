@@ -1,13 +1,17 @@
-"""Task 13 non-Hopfield baseline: MNIST CNN with an Identity bridge at L8.
+"""MNIST baseline: the CNN with an Identity bridge at L8, plus everything the MNIST experiments share.
 
 This module holds the baseline network and every piece shared with the
-Hopfield comparison in ``benchmarks.mnist_prototype_retrieval``: config
-validation, fast tensor data loading, seeded corruptions, the CNN layers,
-training with a checkpoint cache, prototype construction, nearest-prototype
-readout, metrics, and the cost/timing harness. It never imports the Hopfield
-module (the dependency only goes the other way).
+Hopfield experiments in ``benchmarks.mnist``: config validation, fast tensor
+data loading, seeded corruptions, the CNN layers, training with a checkpoint
+cache, prototype construction, nearest-prototype readout, metrics, the
+cost/timing harness, and the reader for the stored tuned parameters. It never
+imports a Hopfield module (the dependency only goes the other way).
 
-Architecture (L8 is the only slot that differs between the two variants):
+The baseline's lr, batch size and epochs are tuned once by
+``benchmarks.mnist.tuning`` and read here from ``benchmarks/mnist/tuned_params.json``
+(``apply_baseline_params``); no experiment tunes anything itself.
+
+Architecture (L8 is the only slot that differs between the variants):
 
     L1 Conv2d(1,32,3,pad=1)+ReLU -> L2 MaxPool2 -> L3 Conv2d(32,64,3,pad=1)+ReLU
     -> L4 MaxPool2 -> L5 Flatten(3136) -> L6 Linear(3136,128)+ReLU
@@ -15,7 +19,8 @@ Architecture (L8 is the only slot that differs between the two variants):
 
 Run the baseline alone (E1 and E3 baseline columns) from the repository root:
 
-    python -m benchmarks.mnist_baseline --config configs/mnist_prototype_retrieval.yaml
+    python -m benchmarks.mnist.tuning --only baseline    # once
+    python -m benchmarks.mnist.baseline
 """
 
 from __future__ import annotations
@@ -41,7 +46,8 @@ import torch.nn.functional as F
 import yaml
 from torch import nn
 
-from benchmarks.validation import validate_beta_values
+from benchmarks.common import tuned_params
+from benchmarks.common.validation import validate_beta_values
 from hopfieldpc.api import validate_beta
 from hopfieldpc.diagnostics import attention_entropy, retrieval_distance, topk_mass
 
@@ -51,9 +57,12 @@ NUM_CLASSES = 10
 IMAGE_SIZE = 28
 
 DEFAULT_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "mnist_prototype_retrieval.yaml"
+    Path(__file__).resolve().parents[2] / "configs" / "mnist" / "hopfield.yaml"
 )
 DEFAULT_REPORTS_DIR = "reports/mnist_prototype_retrieval"
+# Written only by benchmarks.mnist.tuning; every experiment reads it.
+TUNED_PARAMS_PATH = Path(__file__).resolve().with_name("tuned_params.json")
+BASELINE_SECTION = "baseline"
 
 NOISE_TYPES = ("gaussian", "salt_pepper", "occlusion")
 NOISE_GRID_KEYS = {
@@ -106,6 +115,7 @@ CONFIG_KEYS = (
     "prototypes_per_class",
     "beta_selection_sets",
     "baseline_tuning",
+    "tuned_params",
     "cost",
     "quick",
 )
@@ -431,6 +441,7 @@ def validate_mnist_config(config: dict[str, Any]) -> dict[str, Any]:
             config.get("beta_selection_sets", DEFAULT_SELECTION_SETS)
         ),
         "baseline_tuning": _validate_tuning_config(config.get("baseline_tuning", None)),
+        "tuned_params": str(config.get("tuned_params") or TUNED_PARAMS_PATH),
         "cost": _validate_cost_config(config.get("cost", {})),
     }
 
@@ -442,6 +453,7 @@ def load_config(
     seed: int | None = None,
     data_dir: str | None = None,
     reports_dir: str | None = None,
+    tuned_params_path: str | None = None,
 ) -> dict[str, Any]:
     """Read YAML, apply ``--quick`` then CLI overrides, and validate."""
     if not path.exists():
@@ -461,6 +473,8 @@ def load_config(
         config["data_dir"] = data_dir
     if reports_dir is not None:
         config["reports_dir"] = reports_dir
+    if tuned_params_path is not None:
+        config["tuned_params"] = tuned_params_path
     cfg = validate_mnist_config(config)
     cfg["quick"] = quick
     return cfg
@@ -971,8 +985,8 @@ def format_split_table(table: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _tuning_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
-    """Settings a cached tuning result must match to be reused."""
+def baseline_tuning_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
+    """Settings the stored baseline tuning (lr, batch size, epochs) depends on."""
     return {
         "tuning": cfg["baseline_tuning"],
         "selection_sets": [list(s) for s in cfg["beta_selection_sets"]],
@@ -982,106 +996,40 @@ def _tuning_fingerprint(cfg: dict[str, Any], num_train: int) -> dict[str, Any]:
     }
 
 
-def tune_baseline(
-    cfg: dict[str, Any],
-    data: Sequence[torch.Tensor],
-    device: torch.device,
-    *,
-    retrain: bool = False,
-) -> dict[str, Any] | None:
-    """Grid-search the baseline's lr, batch size and epochs on validation data.
+def train_size(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> int:
+    """Number of training images after the validation split and ``train_subset``."""
+    seed = cfg["baseline_tuning"]["seeds"][0] if cfg["baseline_tuning"] else cfg["seeds"][0]
+    splits = make_splits(data, seed=seed, val_size=cfg["val_size"], train_subset=cfg["train_subset"])
+    return int(splits.train_images.shape[0])
 
-    Each (lr, batch_size) is trained once for ``max_epochs`` epochs and scored
-    after every epoch, so every epoch count is a candidate. The score is the
-    same one that selects beta for the Hopfield variant: mean head_acc over
-    ``beta_selection_sets`` (clean + noisy validation, noise stream 1), so
-    both variants are tuned on the same criterion and the test set is never
-    used. Ties -> fewest epochs, then smallest lr, then smallest batch size.
 
-    The winning values are written into ``cfg`` (lr, batch_size, epochs) and
-    the result is cached as ``baseline_tuning.json``. Returns None when
-    tuning is disabled.
+def tuning_command(cfg: dict[str, Any]) -> str:
+    """The command that produces the tuned parameters this config needs."""
+    parts = ["python -m benchmarks.mnist.tuning"]
+    if cfg.get("quick"):
+        parts.append("--quick")
+    if Path(cfg["tuned_params"]).resolve() != TUNED_PARAMS_PATH.resolve():
+        parts.append(f"--tuned-params {cfg['tuned_params']}")
+    return " ".join(parts)
+
+
+def require_tuned(cfg: dict[str, Any], section: str, fingerprint: dict[str, Any]) -> dict[str, Any]:
+    """Tuned values of ``section``, read from ``cfg['tuned_params']``; never tunes."""
+    return tuned_params.require(
+        cfg["tuned_params"], tuned_params.profile_name(bool(cfg.get("quick"))), section, fingerprint,
+        tuning_command=tuning_command(cfg),
+    )
+
+
+def apply_baseline_params(cfg: dict[str, Any], data: Sequence[torch.Tensor]) -> dict[str, Any] | None:
+    """Write the tuned lr / batch size / epochs into ``cfg``.
+
+    Returns the stored tuning result (grid, best, scores), or None when
+    ``baseline_tuning`` is null and the config's own values are used.
     """
-    tuning = cfg["baseline_tuning"]
-    if tuning is None:
+    if cfg["baseline_tuning"] is None:
         return None
-    sets = cfg["beta_selection_sets"]
-    path = Path(cfg["reports_dir"]) / "baseline_tuning.json"
-    first = make_splits(data, seed=tuning["seeds"][0], val_size=cfg["val_size"],
-                        train_subset=cfg["train_subset"])
-    fingerprint = _tuning_fingerprint(cfg, first.train_images.shape[0])
-
-    result: dict[str, Any] | None = None
-    if path.exists() and not retrain:
-        with open(path, encoding="utf-8") as f:
-            cached = json.load(f)
-        if cached.get("fingerprint") == json.loads(json.dumps(fingerprint)):
-            print(f"Baseline tuning: loaded cached result {path}")
-            result = cached
-
-    if result is None:
-        scores: dict[tuple[float, int, int], list[dict[str, float]]] = {}
-        for seed in tuning["seeds"]:
-            splits = make_splits(data, seed=seed, val_size=cfg["val_size"],
-                                 train_subset=cfg["train_subset"])
-            # Clean validation is always evaluated first (reported as val_clean);
-            # the score averages only the configured selection sets.
-            val_sets = [splits.val_images] + [
-                make_corrupted_test_set(
-                    splits.val_images, seed=seed, kind=kind, level=level, stream=1
-                )
-                for kind, level in sets if kind != "clean"
-            ]
-            scored = val_sets if any(kind == "clean" for kind, _ in sets) else val_sets[1:]
-            for lr, bs in itertools.product(tuning["lr_values"], tuning["batch_size_values"]):
-                print(f"  tuning seed {seed}: lr={lr:g} batch={bs}")
-                net = build_baseline_net(seed)
-
-                def score(epoch: int, *, net: EmbeddingClassifier = net, lr: float = lr, bs: int = bs,
-                          val_sets: list[torch.Tensor] = val_sets,
-                          val_labels: torch.Tensor = splits.val_labels,
-                          num_scored: int = len(scored)) -> None:
-                    accs = [
-                        (forward_images(net, images, batch_size=cfg["eval_batch_size"],
-                                        device=device)["head_pred"] == val_labels)
-                        .float().mean().item()
-                        for images in val_sets
-                    ]
-                    scored_accs = accs[len(accs) - num_scored:]
-                    scores.setdefault((lr, bs, epoch), []).append(
-                        {"val_clean": accs[0], "val_score": sum(scored_accs) / num_scored}
-                    )
-
-                train_baseline(net, splits.train_images, splits.train_labels,
-                               epochs=tuning["max_epochs"], batch_size=bs, lr=lr,
-                               seed=seed, device=device, on_epoch_end=score)
-        grid = [
-            {
-                "lr": lr, "batch_size": bs, "epochs": ep,
-                "val_clean": statistics.fmean(s["val_clean"] for s in per_seed),
-                "val_score": statistics.fmean(s["val_score"] for s in per_seed),
-            }
-            for (lr, bs, ep), per_seed in scores.items()
-        ]
-        best = min(grid, key=lambda r: (-r["val_score"], r["epochs"], r["lr"], r["batch_size"]))
-        untuned = next(
-            (r for r in grid if (r["lr"], r["batch_size"], r["epochs"])
-             == (cfg["lr"], cfg["batch_size"], cfg["epochs"])),
-            None,
-        )
-        result = {
-            "fingerprint": fingerprint,
-            "selection_sets": [list(s) for s in sets],
-            "seeds": tuning["seeds"],
-            "grid": grid,
-            "best": {k: best[k] for k in ("lr", "batch_size", "epochs")},
-            "best_scores": {k: best[k] for k in ("val_clean", "val_score")},
-            "untuned": untuned,
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
-
+    result = require_tuned(cfg, BASELINE_SECTION, baseline_tuning_fingerprint(cfg, train_size(cfg, data)))
     cfg.update(result["best"])
     return result
 
@@ -1688,9 +1636,9 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
     data = load_mnist(cfg["data_dir"])
     header = ["Data splits", *format_split_table(split_table(cfg, data)), ""]
     print("\n".join(header))
-    tuning = tune_baseline(cfg, data, device, retrain=retrain)
+    tuning = apply_baseline_params(cfg, data)
     if tuning is not None:
-        header += ["Baseline tuning", *format_tuning_table(tuning), ""]
+        header += ["Baseline tuning (stored)", *format_tuning_table(tuning), ""]
 
     per_seed: dict[str, list[list[dict[str, Any]]]] = {"clean": []}
     grids = noise_grids(cfg)
@@ -1759,6 +1707,8 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None, help="Run a single seed.")
     parser.add_argument("--data-dir", type=str, default=None, help="MNIST download/cache dir.")
     parser.add_argument("--reports-dir", type=str, default=None, help="Output directory.")
+    parser.add_argument("--tuned-params", type=str, default=None,
+                        help="Tuned-parameter file written by benchmarks.mnist.tuning.")
     return parser
 
 
@@ -1770,6 +1720,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         data_dir=args.data_dir,
         reports_dir=args.reports_dir,
+        tuned_params_path=args.tuned_params,
     )
 
 

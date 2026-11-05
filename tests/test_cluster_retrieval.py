@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import torch
 
-from benchmarks.cluster_retrieval import (
+from benchmarks.synthetic.cluster_retrieval import (
     classify_retrieval_regime,
     compute_cluster_masses,
     compute_cluster_metrics,
@@ -1099,7 +1099,7 @@ def test_seed_validation_rejects_duplicates_before_execution(
         pytest.fail("An experiment ran before duplicate seeds were rejected.")
 
     monkeypatch.setattr(
-        "benchmarks.cluster_retrieval.run_single_seed_experiment",
+        "benchmarks.synthetic.cluster_retrieval.run_single_seed_experiment",
         unexpected_run,
     )
     output_dir = tmp_path / "reports"
