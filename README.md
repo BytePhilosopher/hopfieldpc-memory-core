@@ -116,19 +116,17 @@ experiments only read that file, so tuning runs once per dataset and settings.
 benchmarks/
   common/       tuned_params.py (tuned-parameter store), validation.py
   mnist/        tuning.py → tuned_params.json      (baseline, L8, MNIST-C, L5)
-                tuning_trainable.py → tuned_params.json   (trainable memory only)
                 baseline.py               CNN, L8 = Identity (shared data, training, metrics)
                 hopfield.py               Hopfield at L8, frozen memory (E1–E9)
                 hopfield_mnist_c.py       the L8 networks on MNIST-C
                 hopfield_recentering.py   layer change: test-batch centering at L8
                 hopfield_l5.py            layer change: Hopfield after L5 (Flatten)
-                hopfield_trainable.py     layer change: trainable memory at L5 / L8
   cifar10/      tuning.py → tuned_params.json
                 baseline.py               ResNet-18, L8 = Identity
                 hopfield.py               Hopfield at L8, train-mean and test-batch centering
   synthetic/    synthetic_retrieval.py, beta_sweep.py, cluster_retrieval.py (sweeps, nothing tuned)
 configs/
-  mnist/        hopfield.yaml, hopfield_l5.yaml, hopfield_trainable.yaml
+  mnist/        hopfield.yaml, hopfield_l5.yaml
   synthetic/    beta_sweep.yaml, cluster_retrieval.yaml, synthetic_retrieval.yaml
 ```
 
@@ -139,8 +137,7 @@ MNIST `tuning.py` tunes these sections, in dependency order, all on validation d
 | `baseline`           | lr, batch size, epochs                        | every MNIST experiment                             |
 | `hopfield_l8`        | β\*, pixel-placement β, memory-variant βs     | `hopfield.py`                                      |
 | `hopfield_mnist_c`   | β\* on the wider MNIST-C grid                 | `hopfield_mnist_c.py`, `hopfield_recentering.py`   |
-| `hopfield_l5`        | β of Hopfield@L5 (every memory variant) and @L8 | `hopfield_l5.py`, `hopfield_trainable.py`        |
-| `hopfield_trainable` | memory lr, initial β per placement (`tuning_trainable.py`) | `hopfield_trainable.py`               |
+| `hopfield_l5`        | β of Hopfield@L5 (every memory variant) and @L8 | `hopfield_l5.py`        |
 
 ```bash
 python -m benchmarks.mnist.tuning                      # skips every section that is already tuned
