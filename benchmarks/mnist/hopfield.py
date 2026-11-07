@@ -54,6 +54,7 @@ from benchmarks.mnist.baseline import (
     analytical_macs,
     apply_baseline_params,
     build_arg_parser,
+    clean_split_inputs,
     compute_prototypes,
     config_from_args,
     configure_threads,
@@ -61,6 +62,7 @@ from benchmarks.mnist.baseline import (
     count_buffer_values,
     count_trainable_params,
     environment_info,
+    format_split_accuracy,
     format_split_table,
     format_tuning_table,
     forward_embeddings,
@@ -76,8 +78,10 @@ from benchmarks.mnist.baseline import (
     prepare_baseline_run,
     require_tuned,
     resolve_device,
+    split_accuracy,
     split_table,
     summarize_outputs,
+    summarize_split_accuracy,
     time_full_evaluation,
     train_size,
 )
@@ -684,6 +688,7 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
     results: dict[str, list[dict[str, Any]]] = {}
     confusions: dict[str, torch.Tensor] = {}
     sanity_raw: dict[str, list[Any]] = {"s1": [], "s2": [], "s3": []}
+    split_acc: list[dict[str, dict[str, float]]] = []
     grids = noise_grids(cfg)
     sigma = cfg["noisy_sigma"]
     for run, hop, pixel_net in zip(runs, hop_nets, pixel_nets):
@@ -697,6 +702,12 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
             confusions[name] = confusions.get(name, torch.zeros_like(conf)) + conf
 
         bridge.set_retrieval(beta=beta_star, num_updates=1)
+        inputs, split_labels = clean_split_inputs(run)
+        split_acc.append({name: split_accuracy(net, inputs, split_labels, batch_size=run.batch_size,
+                                               device=run.device)
+                          for name, net in (("baseline", run.net), ("hopfield", hop))})
+        print("    train/test accuracy: " + "  ".join(
+            f"{m} {a['train']:.4f}/{a['test']:.4f}" for m, a in split_acc[-1].items()), flush=True)
         pair = compare_on_test(run, hop, "gaussian", 0.0)
         _record(results, "E1", 0, "clean", pair)
         keep_confusion("hopfield_clean", pair, "hopfield")
@@ -793,6 +804,7 @@ def run_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str, A
         "results": results,
         "confusions": {k: v.tolist() for k, v in confusions.items()},
         "sanity_raw": sanity_raw,
+        "split_accuracy": {"per_seed": split_acc, "summary": summarize_split_accuracy(split_acc)},
         "cost": cost,
     }
 
@@ -1168,6 +1180,14 @@ def build_report(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                      " Hopfield proto_acc is the class with the most retrieval weight.")
     sections.append(("E1 Clean performance", lines))
     summary["E1"] = aggregate_point(e1[0], "head_acc")
+
+    if raw.get("split_accuracy"):
+        split_summary = raw["split_accuracy"]["summary"]
+        lines = [" E1b Train vs test accuracy   Varied: model, data split"
+                 f"   Held fixed: β=β*={bstar:g}, T=1, clean", f"     {ctx}",
+                 *format_split_accuracy(split_summary, {"baseline": "Baseline", "hopfield": "Hopfield@L8"})]
+        sections.append(("E1b Train vs test accuracy", lines))
+        summary["split_accuracy"] = split_summary
 
     e2 = res["E2"]
     lines = table_header("E2", "How does β shape retrieval?", "β", "clean, T=1",

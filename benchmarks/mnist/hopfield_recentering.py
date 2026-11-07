@@ -28,14 +28,19 @@ from torch import nn
 from benchmarks.mnist.baseline import (
     MNIST_C_CORRUPTION_GROUPS,
     MNIST_C_UNCORRUPTED_NAME,
+    BaselineRun,
     EmbeddingClassifier,
     build_arg_parser,
+    clean_split_inputs,
     config_from_args,
     encode,
     environment_info,
+    format_split_accuracy,
     forward_embeddings,
     load_mnist_c_test_set,
     mean_std,
+    split_accuracy,
+    summarize_split_accuracy,
 )
 from benchmarks.mnist.hopfield import (
     BASELINE_COLOR,
@@ -58,6 +63,8 @@ from benchmarks.mnist.hopfield_mnist_c import (
 
 MIXED_CORRUPTIONS_NAME = "mixed_corruptions"
 RECENTERING_DETAIL_BATCH_SIZE = 256
+READOUT_LABELS = {"baseline": "Baseline", "hopfield": "Hopfield@L8",
+                  "baseline_recentered": "Baseline + R", "hopfield_recentered": "Hopfield@L8 + R"}
 
 
 class BatchRecenteringLayer(nn.Module):
@@ -72,6 +79,39 @@ class BatchRecenteringLayer(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return z - z.mean(dim=0, keepdim=True) + self.train_mean
+
+
+def readout_split_accuracy(
+    run: BaselineRun,
+    hopfield_net: EmbeddingClassifier,
+    recentered_baseline: EmbeddingClassifier,
+    *,
+    recenter_batch_size: int = RECENTERING_DETAIL_BATCH_SIZE,
+) -> dict[str, dict[str, float]]:
+    """Clean train / val / test accuracy of the four readouts; recentered ones use ``recenter_batch_size``."""
+    bridge = hopfield_net.bridge
+    assert isinstance(bridge, HopfieldRetrievalLayer)
+    inputs, labels = clean_split_inputs(run)
+
+    def accuracy(net: nn.Module, batch_size: int) -> dict[str, float]:
+        return split_accuracy(net, inputs, labels, batch_size=batch_size, device=run.device)
+
+    previous = bridge.query_centering
+    bridge.set_retrieval(query_centering="train_mean")
+    result = {
+        "baseline": accuracy(run.net, run.batch_size),
+        "hopfield": accuracy(hopfield_net, run.batch_size),
+        "baseline_recentered": accuracy(recentered_baseline, recenter_batch_size),
+    }
+    bridge.set_retrieval(query_centering="test_batch_mean")
+    result["hopfield_recentered"] = accuracy(hopfield_net, recenter_batch_size)
+    bridge.set_retrieval(query_centering=previous)
+    return result
+
+
+def format_readout_split_accuracy(summary: dict[str, dict[str, tuple[float, float]]]) -> list[str]:
+    return [*format_split_accuracy(summary, READOUT_LABELS),
+            f"  Recentered readouts (+ R) use batches of {RECENTERING_DETAIL_BATCH_SIZE} in split order."]
 
 
 def mix_corruptions(
@@ -116,6 +156,7 @@ def run_mnist_c_recentering_experiment(cfg: dict[str, Any], *, retrain: bool = F
     corruption_names = [n for names in MNIST_C_CORRUPTION_GROUPS.values() for n in names]
     rows: list[dict[str, Any]] = []
     shared_weights_ok: list[bool] = []
+    split_acc: list[dict[str, dict[str, float]]] = []
     test_subset = cfg["test_subset"]
 
     for run, hopfield_net in zip(runs, hopfield_nets):
@@ -128,6 +169,9 @@ def run_mnist_c_recentering_experiment(cfg: dict[str, Any], *, retrain: bool = F
             run.net.encoder, BatchRecenteringLayer(bridge.center), run.net.head
         ).eval()
         labels = run.splits.test_labels
+        split_acc.append(readout_split_accuracy(run, hopfield_net, recentered_baseline))
+        print("    train/test accuracy: " + "  ".join(
+            f"{m} {a['train']:.4f}/{a['test']:.4f}" for m, a in split_acc[-1].items()), flush=True)
 
         embeddings: dict[str, torch.Tensor] = {}
         for name in [MNIST_C_UNCORRUPTED_NAME, *corruption_names]:
@@ -169,6 +213,7 @@ def run_mnist_c_recentering_experiment(cfg: dict[str, Any], *, retrain: bool = F
         "n_test": int(runs[0].splits.test_labels.shape[0]),
         "num_cached_backbones": sum(run.from_cache for run in runs),
         "shared_weights_identical": all(shared_weights_ok),
+        "split_accuracy": {"per_seed": split_acc, "summary": summarize_split_accuracy(split_acc)},
         "summary": summarize_recentering(rows, corruption_names, cfg["recentering_batch_sizes"]),
     }
 
@@ -258,6 +303,10 @@ def format_recentering_report(
         ]
 
     lines: list[str] = []
+    if raw.get("split_accuracy"):
+        lines += [*table_header(dataset_name, "Train vs test accuracy (clean data)", "readout, data split",
+                                held, context),
+                  *format_readout_split_accuracy(raw["split_accuracy"]["summary"]), ""]
     tables = (
         ("mean_over_corruptions", f"Mean {metric} over the 15 corruptions (each batch holds one corruption)"),
         ("mixed_corruptions", "Mixed corruptions (each image has a random corruption)"),

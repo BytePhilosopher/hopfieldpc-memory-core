@@ -30,11 +30,13 @@ from benchmarks.mnist.baseline import (
     EmbeddingClassifier,
     apply_baseline_params,
     build_arg_parser,
+    clean_split_inputs,
     config_from_args,
     configure_threads,
     encode,
     ensure_mnist_c_downloaded,
     environment_info,
+    format_split_accuracy,
     forward_embeddings,
     load_mnist,
     load_mnist_c_test_set,
@@ -43,7 +45,9 @@ from benchmarks.mnist.baseline import (
     prepare_baseline_run,
     require_tuned,
     resolve_device,
+    split_accuracy,
     summarize_outputs,
+    summarize_split_accuracy,
     train_size,
 )
 from benchmarks.mnist.hopfield import (
@@ -270,6 +274,7 @@ def run_mnist_c_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dic
     uncorrupted_accuracy_gaps: list[float] = []
     hard_readout_agreement: list[float] = []
     shared_weights_ok: list[bool] = []
+    split_acc: list[dict[str, dict[str, float]]] = []
     clean_images = runs[0].splits.test_images
     uncorrupted_images, uncorrupted_labels = load_mnist_c_test_set(
         cfg["data_dir"], MNIST_C_UNCORRUPTED_NAME, test_subset=cfg["test_subset"]
@@ -289,6 +294,11 @@ def run_mnist_c_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dic
         offset = bridge.center.cpu() if bridge.center is not None else torch.zeros(run.z_train.shape[1])
         clean_embeddings = run.test_embeddings("gaussian", 0.0)
         shared_weights_ok.append(shared_weights_equal(run.net, hopfield_net))
+        inputs, split_labels = clean_split_inputs(run)
+        split_acc.append({name: split_accuracy(net, inputs, split_labels, batch_size=run.batch_size, device=device)
+                          for name, net in (("baseline", run.net), ("hopfield", hopfield_net))})
+        print("    train/test accuracy: " + "  ".join(
+            f"{m} {a['train']:.4f}/{a['test']:.4f}" for m, a in split_acc[-1].items()), flush=True)
 
         for corruption, group in set_groups.items():
             images, labels = load_mnist_c_test_set(
@@ -343,6 +353,7 @@ def run_mnist_c_experiment(cfg: dict[str, Any], *, retrain: bool = False) -> dic
             "hard_readout_agreement": min(hard_readout_agreement),
             "shared_weights_identical": all(shared_weights_ok),
         },
+        "split_accuracy": {"per_seed": split_acc, "summary": summarize_split_accuracy(split_acc)},
         "summary": summarize_corruption_suite(rows, MNIST_C_CORRUPTION_GROUPS),
     }
 
@@ -376,6 +387,12 @@ def format_mnist_c_report(raw: dict[str, Any]) -> str:
         c = summary["overall"][key]
         lines.append(f"  {title:<36} │ {_ms(c['first']):>17} │ {_ms(c['second']):>17} │"
                      f" {_signed(c['delta']):>9} │ {seeds(c):>9} │ {_p(c['wilcoxon_p']):>10}")
+
+    if raw.get("split_accuracy"):
+        lines += ["", *table_header("MNIST-C", "Train vs test accuracy (clean MNIST)", "model, data split",
+                                    "β*, T=1, clean", context),
+                  *format_split_accuracy(raw["split_accuracy"]["summary"],
+                                         {"baseline": "Baseline", "hopfield": "Hopfield@L8"})]
 
     lines += ["", *table_header(
         "MNIST-C", "Hopfield vs Baseline per corruption group", "corruption group",

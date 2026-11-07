@@ -78,6 +78,7 @@ from benchmarks.mnist.baseline import (
     environment_info,
     forward_embeddings,
     mean_std,
+    summarize_split_accuracy,
 )
 from benchmarks.mnist.hopfield import (
     HopfieldRetrievalLayer,
@@ -92,6 +93,7 @@ from benchmarks.mnist.hopfield_recentering import (
     format_recentering_report,
     mix_corruptions,
     plot_recentering,
+    readout_split_accuracy,
     summarize_recentering,
 )
 
@@ -108,11 +110,10 @@ def evaluate_seed(
     path = Path(cfg.output_dir) / f"results_seed{seed}.json"
     fingerprint = {**cfg.evaluation_fingerprint(seed), "beta_star": beta_star}
     saved = _load_matching_json(path, fingerprint)
-    if saved is not None:
+    if saved is not None and "split_accuracy" in saved:
         print(f"  seed {seed}: loaded saved results")
         return saved
 
-    print(f"  seed {seed}: evaluating {len(CORRUPTION_NAMES)} corruptions at {len(SEVERITIES)} severities", flush=True)
     run = prepare_seed_run(cfg, data, seed, device)
     hopfield_net = build_embedding_net(run, cfg.prototypes_per_class, cfg.center_prototypes, beta=beta_star)
     bridge = hopfield_net.bridge
@@ -120,6 +121,16 @@ def evaluate_seed(
     recentered_baseline = EmbeddingClassifier(
         run.net.encoder, BatchRecenteringLayer(bridge.center), run.net.head  # type: ignore[arg-type]
     ).eval()
+    split_acc = readout_split_accuracy(run, hopfield_net, recentered_baseline)
+    print(f"  seed {seed}: train/test accuracy " + "  ".join(
+        f"{m} {a['train']:.4f}/{a['test']:.4f}" for m, a in split_acc.items()), flush=True)
+    if saved is not None:
+        # Results saved before train/test accuracy was logged: add it, keep everything else.
+        saved["split_accuracy"] = split_acc
+        _save_json(path, saved)
+        return saved
+
+    print(f"  seed {seed}: evaluating {len(CORRUPTION_NAMES)} corruptions at {len(SEVERITIES)} severities", flush=True)
 
     def predict(net: EmbeddingClassifier, z: torch.Tensor, batch_size: int) -> torch.Tensor:
         return forward_embeddings(net, z, batch_size=batch_size, device=device)["head_pred"]
@@ -175,6 +186,7 @@ def evaluate_seed(
         "labels_match_cifar10": labels_match,
         "shared_weights_identical": shared_weights_equal(run.net, hopfield_net),
         "train_time_s": run.train_time_s,
+        "split_accuracy": split_acc,
     }
     _save_json(path, result)
     return result
@@ -279,6 +291,8 @@ def run_experiment(cfg: Cifar10CConfig) -> tuple[dict[str, Any], str]:
         "num_cached_backbones": num_loaded,
         "shared_weights_identical": all(r["shared_weights_identical"] for r in results),
         "labels_match_cifar10": all(r["labels_match_cifar10"] for r in results),
+        "split_accuracy": {"per_seed": [r["split_accuracy"] for r in results],
+                           "summary": summarize_split_accuracy([r["split_accuracy"] for r in results])},
         "summary": summarize_recentering(collapsed, CORRUPTION_NAMES, cfg.recentering_batch_sizes),
     }
     report = format_recentering_report(raw, dataset_name="CIFAR-10-C", metric="accuracy AUC over severity")

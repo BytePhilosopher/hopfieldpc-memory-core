@@ -1258,6 +1258,76 @@ def mean_std(values: Sequence[float]) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
+# Train / validation / test accuracy (clean), logged by every benchmark
+# ---------------------------------------------------------------------------
+
+SPLIT_NAMES = ("train", "val", "test")
+SPLIT_ACCURACY_NOTE = (
+    "Clean accuracy on each split, % mean ± std over seeds. Train = the training split the backbone and"
+    " prototypes were built from, without augmentation; val selected β; test is the held-out set."
+)
+
+
+def clean_split_inputs(run: "BaselineRun") -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Clean embeddings z and labels of the train, validation and test splits of one seed."""
+    inputs = {"train": run.z_train, "val": run.z_val, "test": run.test_embeddings("gaussian", 0.0)}
+    labels = {"train": run.splits.train_labels, "val": run.splits.val_labels, "test": run.splits.test_labels}
+    return inputs, labels
+
+
+def split_accuracy(
+    net: nn.Module,
+    inputs: dict[str, torch.Tensor],
+    labels: dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> dict[str, float]:
+    """Head accuracy of ``net`` (run from its bridge input) on every split in ``inputs``."""
+    return {
+        split: (forward_embeddings(net, x, batch_size=batch_size, device=device)["head_pred"] == labels[split])
+        .float().mean().item()
+        for split, x in inputs.items()
+    }
+
+
+def summarize_split_accuracy(
+    per_seed: Sequence[dict[str, dict[str, float]]],
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """[{model: {split: acc}} per seed] -> {model: {split: (mean, std)}}."""
+    return {
+        model: {split: mean_std([seed[model][split] for seed in per_seed]) for split in splits}
+        for model, splits in per_seed[0].items()
+    }
+
+
+def format_split_accuracy(
+    summary: dict[str, dict[str, tuple[float, float]]],
+    labels: dict[str, str] | None = None,
+    *,
+    markdown: bool = False,
+) -> list[str]:
+    """Train / val / test accuracy table, one row per model, plus the train − test gap."""
+    labels = labels or {}
+
+    def cell(stat: tuple[float, float]) -> str:
+        return f"{stat[0] * 100:.2f} ± {stat[1] * 100:.2f}"
+
+    rows = [
+        (labels.get(model, model), *(cell(splits[s]) for s in SPLIT_NAMES),
+         f"{(splits['train'][0] - splits['test'][0]) * 100:+.2f}")
+        for model, splits in summary.items()
+    ]
+    header = ("Model", "Train", "Validation", "Test", "Train − Test (pp)")
+    if markdown:
+        return [SPLIT_ACCURACY_NOTE, "", "| " + " | ".join(header) + " |", "|---|---:|---:|---:|---:|",
+                *("| " + " | ".join(r) + " |" for r in rows), ""]
+    width = max(len(r[0]) for r in rows + [header])
+    fmt = f"  {{:<{width}}} │ {{:>15}} │ {{:>15}} │ {{:>15}} │ {{:>17}}"
+    return [f" {SPLIT_ACCURACY_NOTE}", fmt.format(*header), *(fmt.format(*r) for r in rows)]
+
+
+# ---------------------------------------------------------------------------
 # Cost / efficiency harness (shared by both variants)
 # ---------------------------------------------------------------------------
 
@@ -1653,13 +1723,21 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
     grids = noise_grids(cfg)
     for kind in NOISE_TYPES:
         per_seed[kind] = []
+    split_acc: list[dict[str, dict[str, float]]] = []
     for seed in cfg["seeds"]:
         run = prepare_baseline_run(cfg, data, seed, device, retrain=retrain)
+        inputs, split_labels = clean_split_inputs(run)
+        split_acc.append({"baseline": split_accuracy(
+            run.net, inputs, split_labels, batch_size=run.batch_size, device=device)})
+        print(f"  seed {seed}: train {split_acc[-1]['baseline']['train']:.4f}"
+              f"  test {split_acc[-1]['baseline']['test']:.4f}", flush=True)
         per_seed["clean"].append([evaluate_baseline(run, "gaussian", 0.0)])
         for kind in NOISE_TYPES:
             per_seed[kind].append([evaluate_baseline(run, kind, lvl) for lvl in grids[kind]])
 
-    lines: list[str] = list(header)
+    split_summary = summarize_split_accuracy(split_acc)
+    lines: list[str] = [*header, "Train / validation / test accuracy",
+                        *format_split_accuracy(split_summary, {"baseline": "Baseline"}), ""]
     rows: list[dict[str, Any]] = []
     for kind in ("clean", *NOISE_TYPES):
         levels = [0.0] if kind == "clean" else grids[kind]
@@ -1696,7 +1774,8 @@ def run_baseline_only(cfg: dict[str, Any], *, retrain: bool = False) -> dict[str
     out_dir = Path(cfg["reports_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "baseline_results.json", "w", encoding="utf-8") as f:
-        json.dump({"config": cfg, "environment": environment_info(device), "rows": rows}, f, indent=2)
+        json.dump({"config": cfg, "environment": environment_info(device), "rows": rows,
+                   "split_accuracy": {"per_seed": split_acc, "summary": split_summary}}, f, indent=2)
     (out_dir / "baseline_summary.md").write_text(
         f"# Task 13 baseline only (L8 = Identity)\n\n```\n{text}\n```\n", encoding="utf-8"
     )

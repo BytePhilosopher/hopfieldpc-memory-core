@@ -48,11 +48,13 @@ from benchmarks.mnist.baseline import (
     analytical_macs,
     apply_baseline_params,
     checkpoint_fingerprint,
+    clean_split_inputs,
     configure_threads,
     copy_net,
     count_buffer_values,
     count_trainable_params,
     environment_info,
+    format_split_accuracy,
     forward_embeddings,
     interleaved_cost,
     load_config,
@@ -66,7 +68,9 @@ from benchmarks.mnist.baseline import (
     prepare_baseline_run,
     require_tuned,
     resolve_device,
+    split_accuracy,
     summarize_outputs,
+    summarize_split_accuracy,
     train_size,
 )
 from benchmarks.mnist.hopfield import (
@@ -378,13 +382,17 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
     grids = noise_grids(cfg)
     sigma = cfg["noisy_sigma"]
     sanity: list[dict[str, Any]] = []
+    split_acc: list[dict[str, dict[str, float]]] = []
     cost: dict[str, Any] | None = None
     for seed in cfg["seeds"]:
         start = time.perf_counter()
         run = prepare_baseline_run(cfg, data, seed, device)
         if not run.from_cache:
             raise RuntimeError(f"seed {seed}: backbone was not loaded from cache.")
-        l5_nets = build_l5_variant_nets(cfg, run, variant_betas)
+        train_features = encode_features(
+            run.net.encoder, run.splits.train_images, batch_size=run.batch_size, device=device
+        )
+        l5_nets = build_l5_variant_nets(cfg, run, variant_betas, train_features=train_features)
         hop_l5 = l5_nets[configured_name]
         hop_l8 = build_embedding_net(run, *configured, beta=beta_l8)
         hop_l5.bridge.set_retrieval(beta=beta_l5, num_updates=1)
@@ -399,6 +407,17 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
 
         clean = features_of("gaussian", 0.0)
         noisy = features_of("gaussian", sigma)
+
+        # Clean train / validation / test accuracy of every model (L5 runs from L5 features).
+        inputs, split_labels = clean_split_inputs(run)
+        l5_inputs = {"train": train_features, "test": clean, "val": encode_features(
+            run.net.encoder, run.splits.val_images, batch_size=run.batch_size, device=device)}
+        split_acc.append({name: split_accuracy(net, l5_inputs if name == "hopfield_l5" else inputs,
+                                               split_labels, batch_size=run.batch_size, device=device)
+                          for name, net in nets.items()})
+        print(f"  seed {seed}: train/test accuracy " + "  ".join(
+            f"{m} {a['train']:.4f}/{a['test']:.4f}" for m, a in split_acc[-1].items()), flush=True)
+        del train_features, l5_inputs
         _add(results, "clean", "clean", seed, evaluate_models(run, nets, "gaussian", 0.0, clean))
         for kind in NOISE_TYPES:
             for level in grids[kind]:
@@ -446,6 +465,7 @@ def run_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
         "n_test": int(data[2].shape[0]) if cfg["test_subset"] is None else cfg["test_subset"],
         "results": results,
         "sanity": sanity,
+        "split_accuracy": {"per_seed": split_acc, "summary": summarize_split_accuracy(split_acc)},
         "cost": cost,
     }
 
@@ -674,6 +694,9 @@ def build_report(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                      _pp(c["delta"]), f"{c['plus']}/{c['minus']}", _p(c["wilcoxon_p"]),
                      winner(c, "hopfield_l5", "baseline")])
     lines += _table(["Metric", *cols, "Δ L5−Base", "Seeds +/−", "Wilcoxon p", "Winner"], rows)
+    if raw.get("split_accuracy"):
+        lines += ["**Train vs test accuracy**", "",
+                  *format_split_accuracy(raw["split_accuracy"]["summary"], MODEL_LABELS, markdown=True)]
 
     lines += ["## 3. Accuracy at each noise level", ""]
     for kind in NOISE_TYPES:
